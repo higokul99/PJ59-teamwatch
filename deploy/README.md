@@ -1,5 +1,43 @@
 # TeamWatch on the Metora VPS
 
+## Deploy from your laptop
+
+The repository includes `deploy.sh` configured for `root@200.234.39.67`:
+
+```sh
+./deploy.sh test
+./deploy.sh prod
+./deploy.sh rollback
+```
+
+Commit and push your local changes to `origin/main` first. Test uses
+`test-teamwatch.metora.in` on loopback port 8890; production uses
+`teamwatch.metora.in` on loopback port 8891. The script refuses conflicting
+initial ports, dirty checkouts, unpushed commits, and production commits that
+have not completed the test deployment. SSH passwords and key passphrases are
+entered in your terminal. An SSH control socket is removed when the command
+finishes; passwords are never saved by the script.
+
+The test command runs the Docker test suite and builds a release image on the
+VPS. Production reuses that tested image. The first deployment creates a private
+`.env`, a dedicated Nginx site, and requests a certificate through the existing
+Certbot installation. Follow any Certbot prompts yourself. Application health
+is verified over HTTPS. Before production, verify the actual test site in your
+browser, then type `DEPLOY` at the laptop prompt. This is your approval step.
+
+Rollback asks for `ROLLBACK`, switches to the recorded previous production
+commit and its existing image, and preserves the named media volume. Failed
+application or HTTPS health checks attempt to restore the prior running release.
+Do not prune release images you may need for rollback. Release records live in
+`/srv/apps/teamwatch/{test,prod}/.deploy`, outside Git. A first deployment has no
+previous release to restore and stops its service if activation fails.
+
+The script configures Nginx only on first setup and checks the existing site on
+later releases. Changes to domain, port, `.env`, Nginx settings, and media contents
+are not rolled back with application code. Do not run deployments during uploads
+or conversion. Playback restarts paused after a container restart.
+
+
 Use dedicated directories and domains; do not reuse Metohub's site configuration:
 
 - `/srv/apps/teamwatch/test/teamwatch-code`
