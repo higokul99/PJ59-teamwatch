@@ -176,6 +176,8 @@ class RoomTests(unittest.TestCase):
         worker = self.client.get('/sw.js')
         self.assertEqual(worker.status_code, 200)
         self.assertEqual(worker.headers['Service-Worker-Allowed'], '/')
+        self.assertEqual(self.client.get('/').headers['Cache-Control'], 'no-cache')
+        self.assertEqual(self.client.get('/static/app.js').headers['Cache-Control'], 'no-cache')
 
     def test_active_buffering_pauses_everyone_but_stale_events_do_not(self):
         self.fake_media()

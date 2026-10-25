@@ -4,7 +4,7 @@
 importScripts('/static/cache-core.js');
 const {CHUNK_SIZE,range,chunkBounds}=TeamWatchCache;
 const inflight=new Map();
-let database,epoch=0;
+let database,epoch=0,pendingWrites=0;
 self.addEventListener('install',event=>event.waitUntil(self.skipWaiting()));
 self.addEventListener('activate',event=>event.waitUntil(self.clients.claim()));
 function db(){
@@ -56,26 +56,41 @@ async function info(path){
  if(!response.ok)throw Error(`Media access failed (${response.status})`);
  return response.json();
 }
-async function chunk(path,index,total){
+async function chunk(path,index,total,waitForStorage=true){
  const key=`${path}#${index}`;
- if(inflight.has(key))return inflight.get(key);
- const promise=(async()=>{
-  const generation=epoch;
-  try{const cached=await stored(key);if(cached)return {bytes:cached,saved:true};}catch{}
-  const {start,end}=chunkBounds(index,total),controller=new AbortController();
-  const timer=setTimeout(()=>controller.abort(),30000);
-  let bytes;
-  try{
-   const response=await fetch(path,{headers:{Range:`bytes=${start}-${end}`},credentials:'same-origin',cache:'no-store',signal:controller.signal});
-   if(response.status!==206||response.headers.get('Content-Range')!==`bytes ${start}-${end}/${total}`)throw Error('Invalid chunk response');
-   bytes=await response.arrayBuffer();
-   if(bytes.byteLength!==end-start+1)throw Error('Incomplete chunk');
-  }finally{clearTimeout(timer);}
-  if(generation!==epoch)throw Error('Download was cleared');
-  try{await write(key,bytes);return {bytes,saved:true};}catch{return {bytes,saved:false};}
- })();
- inflight.set(key,promise);
- try{return await promise;}finally{if(inflight.get(key)===promise)inflight.delete(key);}
+ let promise=inflight.get(key);
+ if(!promise){
+  promise=(async()=>{
+   const generation=epoch;
+   try{const cached=await stored(key);if(cached)return {bytes:cached,persisted:Promise.resolve(true)};}catch{}
+   const {start,end}=chunkBounds(index,total),controller=new AbortController();
+   const timer=setTimeout(()=>controller.abort(),30000);
+   let bytes;
+   try{
+    const response=await fetch(path,{headers:{Range:`bytes=${start}-${end}`},credentials:'same-origin',cache:'no-store',signal:controller.signal});
+    if(response.status!==206||response.headers.get('Content-Range')!==`bytes ${start}-${end}/${total}`)throw Error('Invalid chunk response');
+    bytes=await response.arrayBuffer();
+    if(bytes.byteLength!==end-start+1)throw Error('Incomplete chunk');
+   }finally{clearTimeout(timer);}
+   if(generation!==epoch)throw Error('Download was cleared');
+   // Playback can consume fetched bytes immediately. Only download progress
+   // waits for disk persistence; a slow IndexedDB write must not stall decoding.
+   // Bound pending write buffers to 4 MiB if device storage is slow. Playback
+   // still streams; a background download can retry unsaved chunks later.
+   let persisted=Promise.resolve(false);
+   if(pendingWrites<4){
+    pendingWrites++;
+    persisted=write(key,bytes).then(()=>true,()=>false).finally(()=>{pendingWrites--;});
+   }
+   return {bytes,persisted};
+  })();
+  inflight.set(key,promise);
+  const cleanup=()=>{if(inflight.get(key)===promise)inflight.delete(key);};
+  // Share bytes with concurrent playback/prefetch until the write completes.
+  promise.then(result=>result.persisted).then(cleanup,cleanup);
+ }
+ const result=await promise;
+ return {bytes:result.bytes,saved:waitForStorage?await result.persisted:null};
 }
 async function serve(request){
  const path=mediaPath(request.url);
@@ -90,7 +105,7 @@ async function serve(request){
    if(offset>selected.end){controller.close();return;}
    try{
     const index=Math.floor(offset/CHUNK_SIZE);
-    const {bytes}=await chunk(path,index,metadata.size);
+    const {bytes}=await chunk(path,index,metadata.size,false);
     if(cancelled)return;
     const base=index*CHUNK_SIZE,limit=Math.min(selected.end+1,base+bytes.byteLength);
     controller.enqueue(new Uint8Array(bytes,offset-base,limit-offset));offset=limit;

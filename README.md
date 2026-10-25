@@ -31,7 +31,7 @@ For a trusted LAN test, set `BIND_ADDRESS=0.0.0.0` and `COOKIE_SECURE=false`, re
 
 - The server owns the position, play state, and start timestamp. Play and seek while playing schedule a start 1.5 seconds ahead.
 - Devices sample server clock offset using WebSocket round-trip measurements and the lowest-latency recent sample. A monotonic browser clock avoids local wall-clock jumps.
-- A deadline timer starts playback at the shared timestamp. Every 100 ms, the client compares its media time with the shared timeline. Small errors use up to ±8% playback-rate adjustment. Normal playback no longer triggers repeated hard seeks, which can interrupt phone audio. Explicit sync/seek commands and initial connection can reposition playback. Clock offset is sampled several times immediately on connection. Use Resync this device for a local correction, or the host’s Sync all devices to schedule a new room-wide anchor. Persistent buffering is debounced and pauses everyone; readiness reports prevent resuming while active devices are unready. New seeks have a grace period so ordinary decoder activity does not pause the room. Resume manually with Play when ready.
+- A deadline timer starts playback at the shared timestamp. Every 100 ms, the client compares its media time with the shared timeline. Small errors use up to ±8% playback-rate adjustment, smoothed over one second with hysteresis so a coarse browser clock does not repeatedly reset playback speed. Normal playback no longer triggers repeated hard seeks, which can interrupt phone audio. Explicit sync/seek commands and initial connection can reposition playback. Clock offset is sampled several times immediately on connection. Use Resync this device for a local correction, or the host’s Sync all devices to schedule a new room-wide anchor. Persistent buffering is debounced and pauses everyone; readiness reports prevent resuming while active devices are unready. New seeks have a grace period so ordinary decoder activity does not pause the room. Resume manually with Play when ready.
 - ffmpeg produces an H.264 video-only MP4, AAC audio-only M4A, and combined MP4 with fast-start metadata. Tracks use the same input timestamp origin. HTTP byte-range requests let browsers buffer and seek without downloading the whole file. This is progressive, on-demand streaming after preparation, not live transcoding or adaptive HLS.
 - Audio-only clients download approximately 160 kbps plus overhead. Video is capped at 1920 pixels wide, with variable bitrate. Each viewer consumes outbound VPS bandwidth independently.
 - There is **no guarantee of identical acoustic latency**. This is best-effort browser synchronization, not sample-accurate multi-device audio. Bluetooth, hardware, buffering, and mobile browser restrictions introduce delay. Use per-device adjustment (±2000 ms); positive values advance playback to compensate for slow audio output. Start with +150 ms for late Bluetooth audio and adjust by ear. Reported drift measures browser media position, not sound reaching headphones.
@@ -110,3 +110,20 @@ paused until someone resumes it. Merely opening the page without connecting
 playback does not participate in this barrier. Mode changes on a playing device
 also pause the room. Mobile OS termination/connection loss is detected when the
 WebSocket closes, which may take time on a broken network.
+
+## Diagnosing playback glitches
+
+Open **Troubleshoot playback** on the affected device and press **Copy playback
+report** after a glitch. The report contains recent waiting/seeking/rate-change
+and room-control events, current buffer depth, playback speed, download status,
+round-trip time, and video frame-drop counters where the browser supports them.
+It includes browser identification but no PIN, room code, cookie, or media title.
+Reports remain on the device unless you choose to copy and share them.
+
+Playback no longer waits for an IndexedDB write before decoding a fetched chunk.
+Download progress still waits for successful storage, with at most four pending
+1 MiB write buffers. If storage cannot keep up, unsaved chunks can stream and the
+page offers retry. Playback speed adjustments use a one-second median window and
+hysteresis instead of writing the decoder rate on every 100 ms sample. App assets
+revalidate on reload, and service-worker setup waits for an installing update to
+activate before setting up media playback.

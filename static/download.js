@@ -15,7 +15,14 @@
   if(!readyPromise)readyPromise=(async()=>{
    if(!('serviceWorker' in navigator)||!('indexedDB' in root)||!root.isSecureContext)return false;
    try{
-    await navigator.serviceWorker.register('/sw.js');
+    const registration=await navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'});
+    const installing=registration.installing||registration.waiting;
+    if(installing&&installing.state!=='activated')await new Promise((resolve,reject)=>{
+     const timer=setTimeout(()=>finish(Error('Worker update timed out')),5000);
+     function finish(error){clearTimeout(timer);installing.removeEventListener('statechange',changed);error?reject(error):resolve();}
+     function changed(){if(installing.state==='activated')finish();else if(installing.state==='redundant')finish(Error('Worker update failed'));}
+     installing.addEventListener('statechange',changed);changed();
+    });
     await Promise.race([navigator.serviceWorker.ready,new Promise((_,reject)=>setTimeout(()=>reject(Error('Worker timeout')),5000))]);
     if(!navigator.serviceWorker.controller)await new Promise(resolve=>{
      const finish=()=>{navigator.serviceWorker.removeEventListener('controllerchange',finish);resolve();};
@@ -43,7 +50,7 @@
    for(let index=0;index<Math.ceil(metadata.size/(1024*1024));index++){
     if(current!==generation)return;
     const result=await request({type:'chunk',path,index});
-    if(!result.saved){emit({status:'fallback',message:'Device storage is full or unavailable. Using streaming.'});return;}
+    if(!result.saved){emit({status:'fallback',message:'Device storage is busy, full, or unavailable. Using streaming; retry downloading later.'});return;}
     completed+=result.bytes;
     emit({status:completed>=metadata.size?'complete':'downloading',bytes:completed,total:metadata.size});
     // Leave room for playback's on-demand range requests between prefetches.

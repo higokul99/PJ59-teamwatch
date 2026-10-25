@@ -1,9 +1,11 @@
 'use strict';
+const rateController=new TeamWatchSync.RateController();
 const $ = id => document.getElementById(id);
 let role, ws, roomState, media, mediaKey = '', mode = localStorage.getItem('tw-mode') || 'combined';
 let enabled = false, clockOffset = 0, clockSamples = [], reconnect, pingTimer, leaving = false, connecting = false, uploading = false;
 let startTimer, clockTimers = [], lastSeek = -Infinity, pendingForce = false, playPending = false;
 let downloadState={},stallSince=null,stallReported=-1;
+let playbackEvents=[],playbackCounts={};
 let adjustment = Number(localStorage.getItem('tw-offset') || 0);
 if (!Number.isFinite(adjustment)) adjustment = 0;
 adjustment = Math.max(-2000, Math.min(2000, adjustment));
@@ -12,6 +14,32 @@ const monotonicEpoch = Date.now() - performance.now();
 const localNow = () => (monotonicEpoch + performance.now()) / 1000;
 const serverNow = () => localNow() + clockOffset;
 const player = () => mode === 'audio' || (media && !media.has_video) ? $('audio') : $('video');
+function bufferedAhead(p){
+ try{for(let i=0;i<p.buffered.length;i++)if(p.buffered.start(i)<=p.currentTime&&p.buffered.end(i)>p.currentTime)return p.buffered.end(i)-p.currentTime;}catch{}
+ return 0;
+}
+function playbackReport(){
+ const p=player();let frames={};
+ try{const quality=$('video').getVideoPlaybackQuality();frames={total:quality.totalVideoFrames,dropped:quality.droppedVideoFrames};}catch{}
+ return {version:'smooth-playback-3',mode,browser:navigator.userAgent,playing:roomState?.playing,
+  mediaPosition:p.currentTime,targetPosition:targetPosition(),rate:p.playbackRate,readyState:p.readyState,
+  bufferedAheadSeconds:Number(bufferedAhead(p).toFixed(2)),download:downloadState.status||'unknown',
+  roundTripMs:clockSamples.length?Math.round(clockSamples.at(-1).rtt*1000):null,
+  frames,counts:{...playbackCounts},events:playbackEvents.slice()};
+}
+function recordPlayback(type,p=player(),extra={}){
+ if(p!==player())return;
+ playbackCounts[type]=(playbackCounts[type]||0)+1;
+ playbackEvents.push({at:Math.round(performance.now()),type,position:Number(p.currentTime.toFixed(3)),rate:p.playbackRate,ready:p.readyState,buffered:Number(bufferedAhead(p).toFixed(2)),...extra});
+ playbackEvents=playbackEvents.slice(-50);
+ $('diagnosticsSummary').textContent=`Buffer events: ${playbackCounts.waiting||0} · Speed changes: ${playbackCounts.ratechange||0} · Seeks: ${playbackCounts.seeking||0}`;
+}
+$('copyReport').onclick=async()=>{
+ const text=JSON.stringify(playbackReport(),null,2);
+ $('reportOutput').hidden=false;$('reportOutput').value=text;
+ try{await navigator.clipboard.writeText(text);$('reportStatus').textContent='Copied. The report is also shown below; paste it into this chat.';}
+ catch{$('reportOutput').hidden=false;$('reportOutput').value=text;$('reportStatus').textContent='Copy the report below.';}
+};
 const fmt = n => {n = Math.max(0, Math.floor(n || 0)); return `${n >= 3600 ? Math.floor(n/3600)+':' : ''}${String(Math.floor(n/60)%60).padStart(2,'0')}:${String(n%60).padStart(2,'0')}`;};
 function notice(message) {$('notice').textContent = message;}
 async function api(path, data) {
@@ -69,7 +97,9 @@ function downloadTrack(){
  const path=player().getAttribute('src');
  if(!path)return;
  TeamWatchDownload.start(path,state=>{
+  const justFinished=state.status==='complete'&&downloadState.status!=='complete';
   downloadState=state;
+  if(justFinished)recordPlayback('download-complete');
   const progress=state.total?state.bytes/state.total*100:0;
   $('downloadProgress').value=progress;
   $('downloadStatus').textContent=state.status==='complete'?'Fully downloaded on this device. Playback uses the saved track.':state.status==='downloading'?`Downloading ${Math.floor(progress)}% · ${(state.bytes/1048576).toFixed(1)} / ${(state.total/1048576).toFixed(1)} MB`:state.message;
@@ -93,7 +123,7 @@ function receiveState(data){
  if(!clockSamples.length)clockOffset=data.server_time-localNow();
  const changed=roomState?.revision!==data.timeline.revision;
  roomState=data.timeline; media=data.media;
- if(changed){pendingForce=true;stallSince=null;}
+ if(changed){pendingForce=true;stallSince=null;recordPlayback('room-state',player(),{revision:roomState.revision,playing:roomState.playing});}
  $('connection').textContent=`${data.count} connected`;
  const devices=(data.participants||[]).filter(p=>p.active);
  $('readiness').textContent=`${devices.filter(p=>p.ready).length}/${devices.length} playback devices ready`;
@@ -118,6 +148,7 @@ function configureMedia(){
  if(key===mediaKey)return;
  if(enabled&&roomState?.playing)command('pause');
  if(globalThis.TeamWatchDownload)TeamWatchDownload.stop();
+ rateController.reset();playbackEvents=[];playbackCounts={};
  mediaKey=key; enabled=false; stallSince=null;downloadState={};reportStatus(); playPending=false; pendingForce=true; lastSeek=-Infinity; clearTimeout(startTimer);
  for(const el of [$('video'),$('audio')]){el.pause();el.removeAttribute('src');el.load();}
  $('resync').disabled=!media; $('retryDownload').disabled=!media;
@@ -172,7 +203,10 @@ function sync(force=false){
   lastSeek=performance.now()/1000;
   p.currentTime=target;
  }
- if(Math.abs(p.playbackRate-decision.rate)>.005)p.playbackRate=decision.rate;
+ let desiredRate=1;
+ if(playing&&!decision.seek&&p.readyState>=3)desiredRate=rateController.update(decision.drift,performance.now()/1000);
+ else rateController.reset();
+ if(Math.abs(p.playbackRate-desiredRate)>.005)p.playbackRate=desiredRate;
  if(playing&&p.paused&&!playPending){
   playPending=true;
   const key=mediaKey;
@@ -189,7 +223,7 @@ function sync(force=false){
 // The deadline timer starts playback at the anchor instead of waiting up to
 // 200 ms for the next periodic check. This interval handles ongoing drift.
 setInterval(sync,100);
-$('resync').onclick=()=>{measureClock();pendingForce=true;sync();scheduleStart();};
+$('resync').onclick=()=>{recordPlayback('local-resync');measureClock();pendingForce=true;sync();scheduleStart();};
 function monitorStall(p,playing){
  const now=performance.now()/1000;
  if(!playing||connecting||p.seeking||now-lastSeek<1.5||serverNow()-roomState.anchor<1){stallSince=null;return;}
@@ -197,11 +231,13 @@ function monitorStall(p,playing){
  if(stallSince===null)stallSince=now;
  if(now-stallSince>=1&&stallReported!==roomState.revision){
   stallReported=roomState.revision;
+  recordPlayback('room-buffering-pause');
   command('buffering',{revision:roomState.revision});
  }
 }
 function command(action,extra={}){
  if(ws?.readyState!==WebSocket.OPEN){notice('Wait for the room connection.');return;}
+ recordPlayback('command:'+action);
  if(action==='play')reportStatus();
  ws.send(JSON.stringify({type:'control',action,...extra}));
 }
@@ -230,6 +266,7 @@ $('upload').onclick=()=>{
 };
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){measureClock();sync(true);scheduleStart();if(enabled)keepAwake();}});
 for(const p of [$('video'),$('audio')]){
+ for(const event of ['waiting','stalled','seeking','seeked','ratechange','playing','pause','error'])p.addEventListener(event,()=>recordPlayback(event,p));
  p.addEventListener('canplay',()=>{if(p===player()){sync();reportStatus();}});
  p.addEventListener('seeked',()=>{if(p===player()){sync();reportStatus();}});
  p.addEventListener('pause',()=>{

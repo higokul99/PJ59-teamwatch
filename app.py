@@ -194,6 +194,8 @@ async def protections(request, call_next):
     response.headers['X-Frame-Options'] = 'DENY'
     if request.url.path.startswith('/api'):
         response.headers['Cache-Control'] = 'no-store'
+    elif request.url.path == '/' or request.url.path.endswith(('.js', '.css')):
+        response.headers['Cache-Control'] = 'no-cache'
     return response
 
 

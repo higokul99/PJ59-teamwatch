@@ -15,9 +15,9 @@ test('chunk bounds include the final short chunk without reading beyond EOF',()=
  assert.deepEqual(chunkBounds(1,CHUNK_SIZE+3),{start:CHUNK_SIZE,end:CHUNK_SIZE+2});
  assert.throws(()=>chunkBounds(2,CHUNK_SIZE+3));
 });
-function workerHarness(){
+function workerHarness(size=CHUNK_SIZE*2+53){
  const mediaPath='/media/0123456789abcdef01234567/audio.m4a';
- const bytes=Uint8Array.from({length:CHUNK_SIZE*2+53},(_,i)=>i%251);
+ const bytes=Uint8Array.from({length:size},(_,i)=>i%251);
  const store=new Map(),network=[];
  let authorized=true;
  const workerFile=fs.readFileSync(path.join(__dirname,'../static/sw.js'),'utf8');
@@ -72,4 +72,31 @@ test('storage quota failure keeps playback working and tells prefetch to stop',a
  assert.equal(result.saved,false);
  const response=await h.serve('bytes=0-1');
  assert.deepEqual(new Uint8Array(await response.arrayBuffer()),h.bytes.slice(0,2));
+});
+
+test('slow storage cannot block the decoder but download progress waits for persistence',async()=>{
+ const h=workerHarness();let release;
+ h.context.writeBarrier=new Promise(resolve=>{release=resolve;});
+ h.run('write=async(key,bytes)=>{await writeBarrier;testStore.set(key,bytes);};');
+ let persisted=false;
+ const downloading=h.run(`chunk('${h.path}',0,${h.bytes.length})`).then(()=>{persisted=true;});
+ try{
+  const response=await h.serve('bytes=0-1');
+  const body=await Promise.race([response.arrayBuffer(),new Promise((_,reject)=>setTimeout(()=>reject(Error('Playback waited for disk storage')),150))]);
+  assert.deepEqual(new Uint8Array(body),h.bytes.slice(0,2));
+  assert.equal(persisted,false);
+ }finally{release();await downloading;}
+ assert.equal(persisted,true);
+});
+
+test('slow storage cannot retain an unbounded number of chunk buffers',async()=>{
+ const h=workerHarness(CHUNK_SIZE*6);let release;
+ h.context.writeBarrier=new Promise(resolve=>{release=resolve;});
+ h.run('write=async(key,bytes)=>{await writeBarrier;testStore.set(key,bytes);};');
+ try{
+  await Promise.all(Array.from({length:6},(_,index)=>h.run(`chunk('${h.path}',${index},${h.bytes.length},false)`)));
+  assert.equal(h.run('pendingWrites'),4);
+  assert.ok(h.run('inflight.size')<=4);
+ }finally{release();await new Promise(resolve=>setImmediate(resolve));}
+ assert.equal(h.run('pendingWrites'),0);
 });

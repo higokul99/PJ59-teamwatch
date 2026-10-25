@@ -102,6 +102,7 @@ test('clock correction re-schedules the same playback deadline',()=>{
 test('normal playback with large drift does not repeatedly seek on iPhone',()=>{
  const h=browserHarness();h.node('video').paused=false;
  h.advance(10000);h.run('sync();');
+ h.advance(11100);h.run('sync();');
  assert.equal(h.node('video').currentTime,0);
  assert.ok(h.node('video').playbackRate>1);
 });
@@ -124,4 +125,47 @@ test('room pause cancelling an in-flight play does not disconnect playback',asyn
  await new Promise(resolve=>setImmediate(resolve));
  assert.equal(h.run('enabled'),true);
  assert.equal(h.outbox.length,0);
+});
+
+test('rate writes stay bounded with a coarse browser media clock',()=>{
+ const h=browserHarness();const p=h.node('video');p.paused=false;
+ let value=1,writes=0;
+ Object.defineProperty(p,'playbackRate',{get:()=>value,set:next=>{value=next;writes++;}});
+ for(let step=0;step<100;step++){
+  const seconds=2+step/10;
+  h.advance(seconds*1000);
+  p.currentTime=Math.max(0,Math.floor((seconds-1.5)*4)/4-.04);
+  h.run('sync();');
+ }
+ assert.ok(writes<=10,`Decoder rate was changed ${writes} times in ten seconds`);
+});
+test('smoothed corrections still catch up a genuinely late device',()=>{
+ const controller=new (require('../static/sync.js').RateController)();
+ let current=9.3;
+ for(let step=0;step<200;step++){
+  const now=10+step/10;
+  current+=controller.update(now-current,now)*.1;
+ }
+ assert.ok(Math.abs(30-current)<.08);
+});
+
+test('diagnostic report distinguishes events and excludes room credentials',()=>{
+ const h=browserHarness();
+ h.run('recordPlayback("waiting");recordPlayback("ratechange");');
+ const report=h.run('playbackReport()');
+ assert.equal(report.counts.waiting,1);
+ assert.equal(report.counts.ratechange,1);
+ assert.equal(report.events.length,2);
+ assert.equal(report.version,'smooth-playback-3');
+ assert.equal('pin' in report,false);
+ assert.equal('code' in report,false);
+ assert.equal('session' in report,false);
+});
+
+test('playback report remains copyable on browsers without clipboard access',async()=>{
+ const h=browserHarness();
+ await h.run('$("copyReport").onclick()');
+ const output=h.node('reportOutput');
+ assert.equal(output.hidden,false);
+ assert.equal(JSON.parse(output.value).version,'smooth-playback-3');
 });
