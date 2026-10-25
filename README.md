@@ -24,14 +24,14 @@ For a trusted LAN test, set `BIND_ADDRESS=0.0.0.0` and `COOKIE_SECURE=false`, re
 2. Open the same URL on the projector and choose **Video only**. The server sends a video file with no audio track.
 3. Friends join with the viewer PIN and select **Audio only** on their phones, or **Video + audio** to watch on their own screens.
 4. Everyone taps **Connect playback** when the movie is ready. The host does this too if watching or listening on that device. The host can also control the room without connecting local playback.
-5. The host presses **Play together**. Play, pause, restart, and seeking affect everyone. Late arrivals catch up to the current room position. Reconnecting devices catch up automatically once their browser permits playback.
+5. Any participant can press **Play for everyone** or **Pause everyone**. The host can restart, seek, or press **Sync all devices** to re-align the room at a common timestamp. Late arrivals catch up after connecting playback. A connected device buffering, stopping, or disconnecting pauses the room. Resume manually with Play when active devices are ready.
 6. Keep phone browser pages visible and screens awake. The app requests a screen wake lock where supported. Background playback, locked screens, battery-saving modes, and browser timer throttling can interfere with synchronization. Switching modes or replacing a movie requires tapping Connect playback again.
 
 ## Synchronization and bandwidth
 
 - The server owns the position, play state, and start timestamp. Play and seek while playing schedule a start 1.5 seconds ahead.
 - Devices sample server clock offset using WebSocket round-trip measurements and the lowest-latency recent sample. A monotonic browser clock avoids local wall-clock jumps.
-- A deadline timer starts playback at the shared timestamp. Every 100 ms, the client compares its media time with the shared timeline. Small errors use up to ±8% playback-rate adjustment; errors above 800 ms seek to catch up, with a two-second cooldown to avoid repeated decoder stalls. Clock offset is sampled several times immediately on connection. Use Resync this device for an immediate clock refresh and playback correction. A slow/buffering device catches up independently rather than pausing the entire room.
+- A deadline timer starts playback at the shared timestamp. Every 100 ms, the client compares its media time with the shared timeline. Small errors use up to ±8% playback-rate adjustment. Normal playback no longer triggers repeated hard seeks, which can interrupt phone audio. Explicit sync/seek commands and initial connection can reposition playback. Clock offset is sampled several times immediately on connection. Use Resync this device for a local correction, or the host’s Sync all devices to schedule a new room-wide anchor. Persistent buffering is debounced and pauses everyone; readiness reports prevent resuming while active devices are unready. New seeks have a grace period so ordinary decoder activity does not pause the room. Resume manually with Play when ready.
 - ffmpeg produces an H.264 video-only MP4, AAC audio-only M4A, and combined MP4 with fast-start metadata. Tracks use the same input timestamp origin. HTTP byte-range requests let browsers buffer and seek without downloading the whole file. This is progressive, on-demand streaming after preparation, not live transcoding or adaptive HLS.
 - Audio-only clients download approximately 160 kbps plus overhead. Video is capped at 1920 pixels wide, with variable bitrate. Each viewer consumes outbound VPS bandwidth independently.
 - There is **no guarantee of identical acoustic latency**. This is best-effort browser synchronization, not sample-accurate multi-device audio. Bluetooth, hardware, buffering, and mobile browser restrictions introduce delay. Use per-device adjustment (±2000 ms); positive values advance playback to compensate for slow audio output. Start with +150 ms for late Bluetooth audio and adjust by ear. Reported drift measures browser media position, not sound reaching headphones.
@@ -55,7 +55,7 @@ Local Python reads environment variables, not `.env` automatically. Defaults wor
 - Allow several times the upload size in free storage: source, video, audio, combined output, and the previous movie may coexist during conversion. The source is deleted after preparation. Successfully replaced media is deleted; failed conversion folders/logs remain for diagnosis and can be manually cleaned when idle.
 - The Docker named volume retains the prepared movie across container restarts. Playback restarts paused at zero; interrupted uploads/conversions are not resumed. Repeated abrupt shutdowns can leave orphaned files needing cleanup.
 - Sessions expire after 24 hours. Set a stable random `SESSION_SECRET` to preserve signed sessions across restarts; leaving it empty generates a new secret each startup. Logout revokes the session in memory and disconnects its sockets. Rotate the secret to invalidate all sessions.
-- Host/viewer PINs are shared credentials for a small trusted group. Login is rate-limited per source IP (10 failed attempts/5 minutes), media requires a session, mutations require same-origin requests, and only hosts can upload/control playback. Behind a proxy, configure trusted proxy IPs correctly to preserve client IP rate limiting. Default proxy trust is loopback only.
+- Host/viewer PINs are shared credentials for a small trusted group. Login is rate-limited per source IP (10 failed attempts/5 minutes), media requires a session, mutations require same-origin requests, and only hosts can upload, seek, restart, or sync all devices. All joined participants can play/pause the room. Behind a proxy, configure trusted proxy IPs correctly to preserve client IP rate limiting. Default proxy trust is loopback only.
 - `GET /health` reports service status and whether ffmpeg/ffprobe are installed. Use `docker compose logs -f` for server logs; conversion diagnostics are in `/app/data/<media-id>/conversion.log`.
 - No DRM, subtitles, multiple audio-track selection, adaptive bitrate, or frame-accurate guarantees in this first version. The first video/audio tracks are selected.
 
@@ -77,4 +77,36 @@ docker build --target test -t teamwatch:test .
 docker run --rm teamwatch:test
 ```
 
-Browser synchronization regressions can also be run with `node --test tests/sync.test.cjs`. Node.js is installed only in the Docker test stage.
+Browser synchronization regressions can also be run with `node --test tests/*.test.cjs`. Node.js is installed only in the Docker test stage.
+
+## Download ahead on each device
+
+On HTTPS (or localhost), the browser downloads the selected track sequentially in
+1 MiB chunks from start to end, into IndexedDB through a service worker. Native
+media range requests read those same chunks; missing chunks are fetched on demand.
+Playback can start while downloading continues. Progress shows how much of the
+selected track is saved; **Fully downloaded** means the sequential download
+completed. Audio-only mode saves only AAC audio, and video-only mode saves a silent
+video track. Switching modes downloads the corresponding track.
+
+Downloads use device storage, not an entire movie held in JavaScript RAM. Old
+movies are removed from the cache when a new movie is selected, and logout clears
+the cache. **Clear device downloads** also removes saved chunks; **Retry download**
+continues using any surviving chunks. Storage limits, private browsing, OS eviction,
+and background restrictions can prevent or remove downloads. If persistent storage
+is unavailable/full, playback falls back to on-demand streaming and reports that
+condition. Plain HTTP on a LAN does not support service workers: use HTTPS on the
+VPS for download-ahead. Keep the page visible while downloading on iPhone.
+
+This is a playback cache, not an offline room: authorization and the shared clock
+still require the server. Losing the room connection pauses playback even when
+media is cached. A completed download avoids further media-byte network traffic
+while its chunks remain saved, but media authorization checks still use the network.
+Full caching does not measure or eliminate a device’s acoustic output latency.
+
+When a connected playback device disconnects, experiences a persistent buffer
+stall, is paused using native controls, or fails playback, the room pauses and stays
+paused until someone resumes it. Merely opening the page without connecting
+playback does not participate in this barrier. Mode changes on a playing device
+also pause the room. Mobile OS termination/connection loss is detected when the
+WebSocket closes, which may take time on a broken network.

@@ -3,6 +3,7 @@ const $ = id => document.getElementById(id);
 let role, ws, roomState, media, mediaKey = '', mode = localStorage.getItem('tw-mode') || 'combined';
 let enabled = false, clockOffset = 0, clockSamples = [], reconnect, pingTimer, leaving = false, connecting = false, uploading = false;
 let startTimer, clockTimers = [], lastSeek = -Infinity, pendingForce = false, playPending = false;
+let downloadState={},stallSince=null,stallReported=-1;
 let adjustment = Number(localStorage.getItem('tw-offset') || 0);
 if (!Number.isFinite(adjustment)) adjustment = 0;
 adjustment = Math.max(-2000, Math.min(2000, adjustment));
@@ -28,6 +29,7 @@ async function enter(){
  $('login').hidden=true; $('room').hidden=false; $('logout').hidden=false;
  $('hostControls').hidden=role!=='host'; $('uploadPanel').hidden=role!=='host';
  $('roomLabel').textContent=`ROOM ${data.room} · ${role.toUpperCase()}`;
+ if(globalThis.TeamWatchDownload)await TeamWatchDownload.ready();
  receiveState(data); openSocket();
 }
 function openSocket(){
@@ -56,7 +58,27 @@ function openSocket(){
  };
  ws.onerror=()=>ws.close();
 }
-function ping(){if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'ping',sent:localNow()}));}
+function ping(){if(ws?.readyState===WebSocket.OPEN){reportStatus();ws.send(JSON.stringify({type:'ping',sent:localNow()}));}}
+function reportStatus(){
+ if(ws?.readyState!==WebSocket.OPEN||!media)return;
+ const p=player();
+ ws.send(JSON.stringify({type:'status',media_id:media.id,active:enabled,ready:enabled&&!p.seeking&&p.readyState>=3,mode,downloaded:downloadState.status==='complete'}));
+}
+function downloadTrack(){
+ if(!media||!globalThis.TeamWatchDownload)return;
+ const path=player().getAttribute('src');
+ if(!path)return;
+ TeamWatchDownload.start(path,state=>{
+  downloadState=state;
+  const progress=state.total?state.bytes/state.total*100:0;
+  $('downloadProgress').value=progress;
+  $('downloadStatus').textContent=state.status==='complete'?'Fully downloaded on this device. Playback uses the saved track.':state.status==='downloading'?`Downloading ${Math.floor(progress)}% · ${(state.bytes/1048576).toFixed(1)} / ${(state.total/1048576).toFixed(1)} MB`:state.message;
+  reportStatus();
+ });
+}
+$('retryDownload').onclick=downloadTrack;
+$('clearDownloads').onclick=async()=>{if(globalThis.TeamWatchDownload)await TeamWatchDownload.clear();downloadState={};$('downloadProgress').value=0;$('downloadStatus').textContent='Device downloads cleared. Playback can stream; tap Retry download to save again.';reportStatus();};
+
 function measureClock(){
  clockTimers.forEach(clearTimeout);
  ping(); clockTimers=[150,350,650,1000].map(delay=>setTimeout(ping,delay));
@@ -71,15 +93,17 @@ function receiveState(data){
  if(!clockSamples.length)clockOffset=data.server_time-localNow();
  const changed=roomState?.revision!==data.timeline.revision;
  roomState=data.timeline; media=data.media;
- if(changed)pendingForce=true;
+ if(changed){pendingForce=true;stallSince=null;}
  $('connection').textContent=`${data.count} connected`;
+ const devices=(data.participants||[]).filter(p=>p.active);
+ $('readiness').textContent=`${devices.filter(p=>p.ready).length}/${devices.length} playback devices ready`;
  $('movieName').textContent=media?.name || 'Your shared cinema';
  if(!uploading)$('uploadStatus').textContent=data.processing.message;
  const busy=uploading||data.processing.status==='processing';
  $('upload').disabled=busy; $('file').disabled=busy;
- $('play').disabled=$('pause').disabled=$('restart').disabled=$('seek').disabled=!media;
+ $('play').disabled=$('pause').disabled=$('restart').disabled=$('seek').disabled=$('syncAll').disabled=!media;
  if(media){$('seek').max=media.duration;}
- notice(data.processing.message);
+ notice(data.timeline.reason||data.processing.message);
  configureMedia(); scheduleStart(); sync();
 }
 function configureMedia(){
@@ -92,9 +116,11 @@ function configureMedia(){
  if(media&&!media.has_video&&mode!=='audio'){mode='audio';configureMedia();return;}
  const key=media ? `${media.id}:${mode}` : '';
  if(key===mediaKey)return;
- mediaKey=key; enabled=false; playPending=false; pendingForce=true; lastSeek=-Infinity; clearTimeout(startTimer);
+ if(enabled&&roomState?.playing)command('pause');
+ if(globalThis.TeamWatchDownload)TeamWatchDownload.stop();
+ mediaKey=key; enabled=false; stallSince=null;downloadState={};reportStatus(); playPending=false; pendingForce=true; lastSeek=-Infinity; clearTimeout(startTimer);
  for(const el of [$('video'),$('audio')]){el.pause();el.removeAttribute('src');el.load();}
- $('resync').disabled=!media;
+ $('resync').disabled=!media; $('retryDownload').disabled=!media;
  $('connect').disabled=!media; $('connect').textContent='Connect playback';
  $('connectHint').textContent='Tap to enable playback on this device.';
  $('volume').disabled=mode==='video';
@@ -104,7 +130,7 @@ function configureMedia(){
  if(media){
   const p=player(); p.muted=mode==='video';
   p.src=`/media/${media.id}/${mode==='audio'?'audio.m4a':mode==='video'?'video.mp4':'combined.mp4'}`;
-  p.load(); $('screenTitle').textContent='Just you and the sound.';
+  p.load(); downloadTrack(); $('screenTitle').textContent='Just you and the sound.';
   $('screenText').textContent='Put on your headphones. Playback follows the host.';
  }
 }
@@ -116,7 +142,7 @@ $('connect').onclick=async()=>{
  const p=player(); connecting=true; pendingForce=true;
  // play() must be called directly from the gesture for mobile autoplay policies.
  try{
-  await p.play(); enabled=true; connecting=false; sync(); scheduleStart(); await keepAwake();
+  await p.play(); enabled=true; connecting=false; sync(); reportStatus(); scheduleStart(); await keepAwake();
   $('connect').textContent='Playback connected ✓';
   $('connectHint').textContent='Keep this page visible for the best synchronization.';
  }catch(e){enabled=false;notice('Playback could not start. Wait for buffering, then tap Connect playback again.');}
@@ -135,6 +161,7 @@ function sync(force=false){
  if(!enabled||connecting){$('syncStatus').textContent='Tap Connect playback';return;}
  if(ws?.readyState!==WebSocket.OPEN){p.pause();return;}
  const playing=roomState.playing&&serverNow()>=roomState.anchor&&target<media.duration;
+ monitorStall(p,playing);
  // Apply pause immediately, even when the decoder is buffering.
  if(!playing&&!p.paused)p.pause();
  if(p.readyState<2){$('syncStatus').textContent='Buffering…';return;}
@@ -145,10 +172,16 @@ function sync(force=false){
   lastSeek=performance.now()/1000;
   p.currentTime=target;
  }
- p.playbackRate=decision.rate;
+ if(Math.abs(p.playbackRate-decision.rate)>.005)p.playbackRate=decision.rate;
  if(playing&&p.paused&&!playPending){
   playPending=true;
-  p.play().catch(()=>{enabled=false;$('connect').textContent='Reconnect playback';notice('Your browser paused playback. Tap Connect playback to resume.');}).finally(()=>{playPending=false;});
+  const key=mediaKey;
+  p.play().catch(()=>{
+   // pause() during a room command aborts a pending play promise on Safari.
+   // That expected cancellation must not disable this device or pause again.
+   if(key!==mediaKey||!roomState?.playing||serverNow()<roomState.anchor)return;
+   command('pause');enabled=false;reportStatus();$('connect').textContent='Reconnect playback';notice('Your browser paused playback. Tap Connect playback to resume.');
+  }).finally(()=>{if(key===mediaKey)playPending=false;});
  }
  const ms=Math.round(Math.abs(decision.drift)*1000);
  $('syncStatus').textContent=!roomState.playing?'Room paused':serverNow()<roomState.anchor?'Starting together…':ms<=30?'Following host · aligned':`Following host · ${ms} ms ${decision.drift>0?'behind':'ahead'}`;
@@ -157,17 +190,29 @@ function sync(force=false){
 // 200 ms for the next periodic check. This interval handles ongoing drift.
 setInterval(sync,100);
 $('resync').onclick=()=>{measureClock();pendingForce=true;sync();scheduleStart();};
+function monitorStall(p,playing){
+ const now=performance.now()/1000;
+ if(!playing||connecting||p.seeking||now-lastSeek<1.5||serverNow()-roomState.anchor<1){stallSince=null;return;}
+ if(p.readyState>=3){stallSince=null;return;}
+ if(stallSince===null)stallSince=now;
+ if(now-stallSince>=1&&stallReported!==roomState.revision){
+  stallReported=roomState.revision;
+  command('buffering',{revision:roomState.revision});
+ }
+}
 function command(action,extra={}){
  if(ws?.readyState!==WebSocket.OPEN){notice('Wait for the room connection.');return;}
+ if(action==='play')reportStatus();
  ws.send(JSON.stringify({type:'control',action,...extra}));
 }
 $('play').onclick=()=>command('play'); $('pause').onclick=()=>command('pause');
+$('syncAll').onclick=()=>command('sync');
 $('restart').onclick=()=>command('seek',{position:0});
 $('seek').onchange=()=>command('seek',{position:Number($('seek').value)});
 $('offset').onchange=()=>{adjustment=Math.max(-2000,Math.min(2000,Number($('offset').value)||0));$('offset').value=adjustment;localStorage.setItem('tw-offset',adjustment);sync(true);};
 $('volume').oninput=()=>{for(const p of [$('video'),$('audio')])p.volume=Number($('volume').value);$('volumeValue').textContent=`${Math.round(Number($('volume').value)*100)}%`;};
 $('fullscreen').onclick=async()=>{try{if($('video').webkitEnterFullscreen&&!$('video').requestFullscreen)$('video').webkitEnterFullscreen();else await $('video').requestFullscreen();}catch{notice('Full screen is not supported on this browser.');}};
-$('logout').onclick=async()=>{try{await api('/api/logout',{});leaving=true;ws?.close();location.reload();}catch(e){notice(e.message);}};
+$('logout').onclick=async()=>{try{await api('/api/logout',{});if(globalThis.TeamWatchDownload)await TeamWatchDownload.clear();leaving=true;ws?.close();location.reload();}catch(e){notice(e.message);}};
 $('upload').onclick=()=>{
  const file=$('file').files[0]; if(!file){notice('Choose a movie or song first.');return;}
  uploading=true;$('upload').disabled=true;$('file').disabled=true;$('uploadProgress').hidden=false;
@@ -185,8 +230,12 @@ $('upload').onclick=()=>{
 };
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){measureClock();sync(true);scheduleStart();if(enabled)keepAwake();}});
 for(const p of [$('video'),$('audio')]){
- p.addEventListener('canplay',()=>{if(p===player())sync();});
- p.addEventListener('seeked',()=>{if(p===player())sync();});
+ p.addEventListener('canplay',()=>{if(p===player()){sync();reportStatus();}});
+ p.addEventListener('seeked',()=>{if(p===player()){sync();reportStatus();}});
+ p.addEventListener('pause',()=>{
+  if(p===player()&&enabled&&!connecting&&roomState?.playing&&serverNow()>=roomState.anchor&&ws?.readyState===WebSocket.OPEN&&!p.seeking&&performance.now()/1000-lastSeek>1.5)command('pause');
+ });
+ p.addEventListener('ended',()=>{if(p===player()&&enabled&&roomState?.playing)command('pause');});
 }
-for(const p of [$('video'),$('audio')])p.addEventListener('error',()=>{if(p.getAttribute('src'))notice('This media could not be loaded. Check your connection, then switch mode or rejoin.');});
+for(const p of [$('video'),$('audio')])p.addEventListener('error',()=>{if(p===player()&&enabled&&roomState?.playing)command('pause');if(p.getAttribute('src'))notice('This media could not be loaded. Check your connection, then switch mode or rejoin.');});
 enter().catch(()=>{});

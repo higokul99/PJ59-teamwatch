@@ -25,6 +25,7 @@ class RoomTests(unittest.TestCase):
         app.attempts.clear()
         app.sessions_revoked.clear()
         app.peers.clear()
+        app.peer_status.clear()
         app.upload_busy = False
         app.processing = {'status': 'idle', 'message': 'Ready'}
         app.state.update(playing=False, position=0, anchor=100, revision=0)
@@ -103,14 +104,19 @@ class RoomTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             app.control({'action': 'seek', 'position': float('nan')})
 
-    def test_viewer_cannot_control_socket(self):
+    def test_viewer_can_play_pause_but_not_seek_or_sync(self):
         self.fake_media()
         self.join()
         with self.client.websocket_connect('/ws', headers=ORIGIN) as ws:
             self.assertEqual(ws.receive_json()['type'], 'state')
-            ws.send_json({'type': 'control', 'action': 'play'})
+            ws.send_json({'type': 'control', 'action': 'seek', 'position': 42})
             self.assertEqual(ws.receive_json()['type'], 'error')
-            self.assertFalse(app.state['playing'])
+            ws.send_json({'type': 'control', 'action': 'sync'})
+            self.assertEqual(ws.receive_json()['type'], 'error')
+            ws.send_json({'type': 'control', 'action': 'play'})
+            self.assertTrue(ws.receive_json()['timeline']['playing'])
+            ws.send_json({'type': 'control', 'action': 'pause'})
+            self.assertFalse(ws.receive_json()['timeline']['playing'])
             ws.send_json({'type': 'ping', 'sent': 123})
             self.assertEqual(ws.receive_json()['sent'], 123)
             self.assertEqual(ws.receive_json()['type'], 'state')
@@ -159,6 +165,57 @@ class RoomTests(unittest.TestCase):
         self.assertEqual(app.processing['status'], 'error')
         self.assertFalse(source.exists())
         self.assertFalse(app.upload_busy)
+
+    def test_download_metadata_and_worker(self):
+        self.fake_media()
+        url = '/api/media/testmedia/audio.m4a'
+        self.assertEqual(self.client.get(url).status_code, 401)
+        self.join()
+        self.assertEqual(self.client.get(url).json(), {'size': 10, 'type': 'audio/mp4'})
+        self.assertEqual(self.client.get('/api/media/testmedia/conversion.log').status_code, 404)
+        worker = self.client.get('/sw.js')
+        self.assertEqual(worker.status_code, 200)
+        self.assertEqual(worker.headers['Service-Worker-Allowed'], '/')
+
+    def test_active_buffering_pauses_everyone_but_stale_events_do_not(self):
+        self.fake_media()
+        self.join()
+        with self.client.websocket_connect('/ws', headers=ORIGIN) as ws:
+            ws.receive_json()
+            ws.send_json({'type': 'status', 'media_id': 'testmedia', 'active': True, 'ready': True, 'mode': 'audio'})
+            ws.send_json({'type': 'control', 'action': 'play'})
+            revision = ws.receive_json()['timeline']['revision']
+            ws.send_json({'type': 'control', 'action': 'buffering', 'revision': revision - 1})
+            ws.send_json({'type': 'ping', 'sent': 1})
+            ws.receive_json()
+            self.assertTrue(ws.receive_json()['timeline']['playing'])
+            ws.send_json({'type': 'control', 'action': 'buffering', 'revision': revision})
+            paused = ws.receive_json()['timeline']
+            self.assertFalse(paused['playing'])
+            self.assertIn('buffering', paused['reason'])
+
+    def test_play_waits_for_active_devices_and_disconnect_pauses_room(self):
+        self.fake_media()
+        self.join()
+        with self.client.websocket_connect('/ws', headers=ORIGIN) as ws:
+            ws.receive_json()
+            ws.send_json({'type': 'status', 'media_id': 'testmedia', 'active': True, 'ready': False})
+            ws.send_json({'type': 'control', 'action': 'play'})
+            self.assertEqual(ws.receive_json()['type'], 'error')
+            ws.send_json({'type': 'status', 'media_id': 'testmedia', 'active': True, 'ready': True})
+            ws.send_json({'type': 'control', 'action': 'play'})
+            self.assertTrue(ws.receive_json()['timeline']['playing'])
+        self.assertFalse(app.state['playing'])
+        self.assertIn('disconnected', app.state['reason'])
+
+    def test_host_sync_keeps_position_and_schedules_common_start(self):
+        self.fake_media()
+        app.state.update(position=30, anchor=100, playing=True)
+        with patch.object(app.time, 'time', return_value=105):
+            app.control({'action': 'sync'})
+        self.assertEqual(app.state['position'], 35)
+        self.assertEqual(app.state['anchor'], 106.5)
+        self.assertTrue(app.state['playing'])
 
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe unavailable')
     def test_actual_movie_and_audio_conversion(self):

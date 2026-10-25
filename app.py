@@ -34,6 +34,7 @@ TTL = 24 * 60 * 60
 sessions_revoked = {}
 attempts = defaultdict(deque)
 peers = {}
+peer_status = {}
 job = None
 upload_busy = False
 media = None
@@ -81,7 +82,9 @@ def position(now=None):
 
 def snapshot():
     return {'type': 'state', 'timeline': state.copy(), 'media': media,
-            'processing': processing.copy(), 'count': len(peers), 'server_time': time.time()}
+            'processing': processing.copy(), 'count': len(peers),
+            'participants': [peer_status.get(ws, {'active': False, 'ready': False}) for ws in peers],
+            'server_time': time.time()}
 
 
 async def broadcast():
@@ -94,6 +97,10 @@ async def send(ws, value):
         await asyncio.wait_for(ws.send_json(value), 2)
     except Exception:
         peers.pop(ws, None)
+        try:
+            await ws.close(code=1011)
+        except Exception:
+            pass
 
 
 async def process(source, ident, name):
@@ -285,14 +292,32 @@ async def upload(request: Request):
         raise
 
 
-@app.get('/media/{ident}/{track}')
-async def stream(ident: str, track: str, request: Request):
+@app.get('/sw.js')
+async def service_worker():
+    return FileResponse(BASE / 'static/sw.js', media_type='text/javascript',
+                        headers={'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/'})
+
+
+@app.get('/api/media/{ident}/{track}')
+async def media_details(ident: str, track: str, request: Request):
     auth(request)
+    path = media_path(ident, track)
+    return {'size': path.stat().st_size, 'type': 'audio/mp4' if track == 'audio.m4a' else 'video/mp4'}
+
+
+def media_path(ident, track):
     if not media or ident != media['id'] or track not in ('video.mp4', 'audio.m4a', 'combined.mp4'):
         raise HTTPException(404)
     path = DATA / ident / track
     if not path.exists():
         raise HTTPException(404)
+    return path
+
+
+@app.get('/media/{ident}/{track}')
+async def stream(ident: str, track: str, request: Request):
+    auth(request)
+    path = media_path(ident, track)
     return FileResponse(path, media_type='audio/mp4' if track == 'audio.m4a' else 'video/mp4', headers={'Cache-Control': 'private, no-cache'})
 
 
@@ -300,7 +325,7 @@ def control(body):
     if not media:
         raise ValueError('Upload a movie first.')
     action = body.get('action')
-    if action not in ('play', 'pause', 'seek'):
+    if action not in ('play', 'pause', 'seek', 'sync'):
         raise ValueError('Unknown playback command.')
     now = time.time()
     pos = position(now)
@@ -309,10 +334,11 @@ def control(body):
         if not math.isfinite(pos):
             raise ValueError('Invalid seek position.')
         pos = max(0.0, min(media['duration'], pos))
-    playing = state['playing'] if action == 'seek' else action == 'play'
+    playing = state['playing'] if action in ('seek', 'sync') else action == 'play'
     if action == 'play' and pos >= media['duration']:
         pos = 0.0
-    state.update(position=pos, playing=playing, anchor=now + (1.5 if playing else 0), revision=state['revision'] + 1)
+    state.update(position=pos, playing=playing, anchor=now + (1.5 if playing else 0),
+                 revision=state['revision'] + 1, reason=body.get('reason', ''))
 
 
 @app.websocket('/ws')
@@ -323,6 +349,7 @@ async def websocket(ws: WebSocket):
         return
     await ws.accept()
     peers[ws] = token
+    peer_status[ws] = {'active': False, 'ready': False}
     await broadcast()
     try:
         while True:
@@ -336,19 +363,45 @@ async def websocket(ws: WebSocket):
             if body.get('type') == 'ping':
                 await send(ws, {'type': 'pong', 'sent': body.get('sent'), 'server_time': time.time()})
                 await send(ws, snapshot())
+            elif body.get('type') == 'status':
+                # Readiness is advisory; only devices which enabled playback
+                # participate in the play barrier and disconnect-pause rule.
+                if not media or body.get('media_id') != media['id']:
+                    continue
+                peer_status[ws] = {
+                    'active': body.get('active') is True,
+                    'ready': body.get('ready') is True,
+                    'mode': body.get('mode') if body.get('mode') in ('audio', 'video', 'combined') else 'audio',
+                    'downloaded': body.get('downloaded') is True,
+                }
             elif body.get('type') == 'control':
-                if role != 'host':
-                    await send(ws, {'type': 'error', 'message': 'Only the host controls playback.'})
+                action = body.get('action')
+                if role != 'host' and action not in ('play', 'pause', 'buffering'):
+                    await send(ws, {'type': 'error', 'message': 'Only the host can seek or sync all devices.'})
                     continue
                 try:
-                    control(body)
+                    if action == 'buffering':
+                        # Ignore a delayed stall event from a previous seek/play.
+                        if (not state['playing'] or body.get('revision') != state['revision']
+                                or not peer_status.get(ws, {}).get('active')):
+                            continue
+                        control({'action': 'pause', 'reason': 'A device is buffering. Everyone is paused; press Play when ready.'})
+                    elif action == 'play':
+                        if any(status.get('active') and not status.get('ready') for peer, status in peer_status.items() if peer in peers):
+                            raise ValueError('Wait for connected playback devices to be ready, then press Play again.')
+                        control({'action': 'play'})
+                    else:
+                        control({'action': action, 'position': body.get('position', 0)})
                     await broadcast()
                 except (ValueError, TypeError) as exc:
                     await send(ws, {'type': 'error', 'message': str(exc)})
     except (WebSocketDisconnect, RuntimeError, ValueError):
         pass
     finally:
+        active = peer_status.pop(ws, {}).get('active')
         peers.pop(ws, None)
+        if active and media and state['playing']:
+            control({'action': 'pause', 'reason': 'A playback device disconnected. Everyone is paused.'})
         await broadcast()
 
 
