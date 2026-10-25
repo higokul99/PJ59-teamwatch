@@ -327,7 +327,7 @@ def control(body):
     if not media:
         raise ValueError('Upload a movie first.')
     action = body.get('action')
-    if action not in ('play', 'pause', 'seek', 'sync'):
+    if action not in ('play', 'pause', 'seek', 'sync', 'skip', 'restart'):
         raise ValueError('Unknown playback command.')
     now = time.time()
     pos = position(now)
@@ -336,7 +336,14 @@ def control(body):
         if not math.isfinite(pos):
             raise ValueError('Invalid seek position.')
         pos = max(0.0, min(media['duration'], pos))
-    playing = state['playing'] if action in ('seek', 'sync') else action == 'play'
+    if action == 'skip':
+        seconds = float(body.get('seconds', 0))
+        if seconds not in (-10, 10):
+            raise ValueError('Skip must be 10 seconds backward or forward.')
+        pos = max(0.0, min(media['duration'], pos + seconds))
+    elif action == 'restart':
+        pos = 0.0
+    playing = state['playing'] if action in ('seek', 'sync', 'skip', 'restart') else action == 'play'
     if action == 'play' and pos >= media['duration']:
         pos = 0.0
     state.update(position=pos, playing=playing, anchor=now + (1.5 if playing else 0),
@@ -379,7 +386,7 @@ async def websocket(ws: WebSocket):
             elif body.get('type') == 'control':
                 action = body.get('action')
                 if role != 'host' and action not in ('play', 'pause', 'buffering'):
-                    await send(ws, {'type': 'error', 'message': 'Only the host can seek or sync all devices.'})
+                    await send(ws, {'type': 'error', 'message': 'Only the host can seek, skip, restart, or sync all devices.'})
                     continue
                 try:
                     if action == 'buffering':
@@ -393,7 +400,7 @@ async def websocket(ws: WebSocket):
                             raise ValueError('Wait for connected playback devices to be ready, then press Play again.')
                         control({'action': 'play'})
                     else:
-                        control({'action': action, 'position': body.get('position', 0)})
+                        control({'action': action, 'position': body.get('position', 0), 'seconds': body.get('seconds', 0)})
                     await broadcast()
                 except (ValueError, TypeError) as exc:
                     await send(ws, {'type': 'error', 'message': str(exc)})

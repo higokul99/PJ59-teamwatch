@@ -111,8 +111,9 @@ class RoomTests(unittest.TestCase):
             self.assertEqual(ws.receive_json()['type'], 'state')
             ws.send_json({'type': 'control', 'action': 'seek', 'position': 42})
             self.assertEqual(ws.receive_json()['type'], 'error')
-            ws.send_json({'type': 'control', 'action': 'sync'})
-            self.assertEqual(ws.receive_json()['type'], 'error')
+            for action in ('sync', 'skip', 'restart'):
+                ws.send_json({'type': 'control', 'action': action, 'seconds': 10})
+                self.assertEqual(ws.receive_json()['type'], 'error')
             ws.send_json({'type': 'control', 'action': 'play'})
             self.assertTrue(ws.receive_json()['timeline']['playing'])
             ws.send_json({'type': 'control', 'action': 'pause'})
@@ -218,6 +219,49 @@ class RoomTests(unittest.TestCase):
         self.assertEqual(app.state['position'], 35)
         self.assertEqual(app.state['anchor'], 106.5)
         self.assertTrue(app.state['playing'])
+
+    def test_host_skip_clamps_boundaries_and_preserves_pause(self):
+        self.fake_media()
+        app.state.update(position=5, playing=False)
+        app.control({'action': 'skip', 'seconds': -10})
+        self.assertEqual(app.state['position'], 0)
+        self.assertFalse(app.state['playing'])
+        app.control({'action': 'skip', 'seconds': 10})
+        self.assertEqual(app.state['position'], 10)
+        app.state['position'] = 115
+        app.control({'action': 'skip', 'seconds': 10})
+        self.assertEqual(app.state['position'], 120)
+        for invalid in (0, 30, float('nan'), float('inf')):
+            with self.assertRaises(ValueError):
+                app.control({'action': 'skip', 'seconds': invalid})
+
+    def test_host_skip_uses_server_time_and_restart_preserves_playing(self):
+        self.fake_media()
+        app.state.update(position=30, playing=True, anchor=100)
+        with patch.object(app.time, 'time', return_value=105):
+            app.control({'action': 'skip', 'seconds': -10})
+            self.assertEqual(app.state['position'], 25)
+            self.assertEqual(app.state['anchor'], 106.5)
+            app.control({'action': 'skip', 'seconds': -10})
+            self.assertEqual(app.state['position'], 15)
+            app.control({'action': 'restart'})
+            self.assertEqual(app.state['position'], 0)
+            self.assertTrue(app.state['playing'])
+        app.state['playing'] = False
+        app.control({'action': 'restart'})
+        self.assertFalse(app.state['playing'])
+
+    def test_host_skip_and_restart_over_websocket(self):
+        self.fake_media()
+        self.join('9292')
+        with self.client.websocket_connect('/ws', headers=ORIGIN) as ws:
+            ws.receive_json()
+            for command, expected in [({'action': 'seek', 'position': 40}, 40),
+                                      ({'action': 'skip', 'seconds': 10}, 50),
+                                      ({'action': 'skip', 'seconds': -10}, 40),
+                                      ({'action': 'restart'}, 0)]:
+                ws.send_json({'type': 'control', **command})
+                self.assertEqual(ws.receive_json()['timeline']['position'], expected)
 
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe unavailable')
     def test_actual_movie_and_audio_conversion(self):

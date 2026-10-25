@@ -169,3 +169,31 @@ test('playback report remains copyable on browsers without clipboard access',asy
  assert.equal(output.hidden,false);
  assert.equal(JSON.parse(output.value).version,'smooth-playback-3');
 });
+
+test('timestamp parser accepts movie times and rejects malformed input',()=>{
+ const parse=require('../static/sync.js').parseTimestamp;
+ for(const [input,expected] of [['0',0],['90',90],['01:23',83],['90:00',5400],['01:02:03',3723],[' 02:10 ',130]])assert.equal(parse(input),expected);
+ for(const input of ['', '-10', '1:99', '1:60:00', '01:2', '1:2:3', 'abc', '1:02:03:04', '99999999999999999'])assert.equal(parse(input),null,input);
+});
+test('host skip and restart controls send authoritative room commands',()=>{
+ const h=browserHarness();
+ h.node('back10').onclick();h.node('forward10').onclick();h.node('restart').onclick();
+ assert.deepEqual(h.outbox.map(({action,seconds})=>({action,seconds})),[
+  {action:'skip',seconds:-10},{action:'skip',seconds:10},{action:'restart',seconds:undefined}
+ ]);
+});
+test('timestamp jump validates duration before broadcasting',()=>{
+ const h=browserHarness();const submit=()=>h.node('jumpForm').onsubmit({preventDefault(){}});
+ h.node('jumpTime').value='01:23';submit();
+ assert.equal(h.outbox.at(-1).position,83);
+ h.node('jumpTime').value='99:00';submit();
+ assert.equal(h.outbox.length,1);assert.ok(h.node('jumpError').textContent.includes('between'));
+ h.node('jumpTime').value='invalid';submit();assert.equal(h.outbox.length,1);
+});
+test('dragging previews time without seeking until released, then tracking resumes',()=>{
+ const h=browserHarness();const slider=h.node('seek');slider.value='25';
+ slider.oninput();assert.equal(h.outbox.length,0);assert.equal(h.node('seekPreview').textContent,'00:25');
+ h.advance(3000);h.run('sync();');assert.equal(slider.value,'25');
+ slider.onchange();assert.equal(h.outbox.at(-1).position,25);
+ h.run('sync();');assert.equal(slider.value,1.5);
+});

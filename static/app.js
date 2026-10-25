@@ -4,7 +4,7 @@ const $ = id => document.getElementById(id);
 let role, ws, roomState, media, mediaKey = '', mode = localStorage.getItem('tw-mode') || 'combined';
 let enabled = false, clockOffset = 0, clockSamples = [], reconnect, pingTimer, leaving = false, connecting = false, uploading = false;
 let startTimer, clockTimers = [], lastSeek = -Infinity, pendingForce = false, playPending = false;
-let downloadState={},stallSince=null,stallReported=-1;
+let downloadState={},stallSince=null,stallReported=-1,seekDragging=false;
 let playbackEvents=[],playbackCounts={};
 let adjustment = Number(localStorage.getItem('tw-offset') || 0);
 if (!Number.isFinite(adjustment)) adjustment = 0;
@@ -78,7 +78,7 @@ function openSocket(){
   else if(data.type==='error') notice(data.message);
  };
  ws.onclose=e=>{
-  clearInterval(pingTimer); clearTimeout(startTimer); clockTimers.forEach(clearTimeout); $('connection').textContent='Disconnected';
+  clearInterval(pingTimer); clearTimeout(startTimer); clockTimers.forEach(clearTimeout); $('connection').textContent='Disconnected from room';
   $('video').pause(); $('audio').pause();
   if(leaving)return;
   if(e.code===1008){notice('Your session ended. Leave the room and join again.');return;}
@@ -124,14 +124,15 @@ function receiveState(data){
  const changed=roomState?.revision!==data.timeline.revision;
  roomState=data.timeline; media=data.media;
  if(changed){pendingForce=true;stallSince=null;recordPlayback('room-state',player(),{revision:roomState.revision,playing:roomState.playing});}
- $('connection').textContent=`${data.count} connected`;
+ const roomCount=Number(data.count)||0;
+ $('connection').textContent=`${roomCount} device${roomCount===1?'':'s'} connected to room`;
  const devices=(data.participants||[]).filter(p=>p.active);
  $('readiness').textContent=`${devices.filter(p=>p.ready).length}/${devices.length} playback devices ready`;
  $('movieName').textContent=media?.name || 'Your shared cinema';
  if(!uploading)$('uploadStatus').textContent=data.processing.message;
  const busy=uploading||data.processing.status==='processing';
  $('upload').disabled=busy; $('file').disabled=busy;
- $('play').disabled=$('pause').disabled=$('restart').disabled=$('seek').disabled=$('syncAll').disabled=!media;
+ $('play').disabled=$('pause').disabled=$('restart').disabled=$('seek').disabled=$('syncAll').disabled=$('back10').disabled=$('forward10').disabled=$('jumpTime').disabled=$('jumpButton').disabled=!media;
  if(media){$('seek').max=media.duration;}
  notice(data.timeline.reason||data.processing.message);
  configureMedia(); scheduleStart(); sync();
@@ -188,7 +189,8 @@ function sync(force=false){
  if(!media||!roomState)return;
  const p=player(), target=targetPosition();
  $('time').textContent=`${fmt(target)} / ${fmt(media.duration)}`;
- if(document.activeElement!==$('seek'))$('seek').value=target;
+ if(!seekDragging){$('seek').value=target;$('seekPreview').textContent=fmt(target);}
+ $('seek').setAttribute('aria-valuetext',fmt(Number($('seek').value))+' of '+fmt(media.duration));
  if(!enabled||connecting){$('syncStatus').textContent='Tap Connect playback';return;}
  if(ws?.readyState!==WebSocket.OPEN){p.pause();return;}
  const playing=roomState.playing&&serverNow()>=roomState.anchor&&target<media.duration;
@@ -243,8 +245,21 @@ function command(action,extra={}){
 }
 $('play').onclick=()=>command('play'); $('pause').onclick=()=>command('pause');
 $('syncAll').onclick=()=>command('sync');
-$('restart').onclick=()=>command('seek',{position:0});
-$('seek').onchange=()=>command('seek',{position:Number($('seek').value)});
+$('restart').onclick=()=>command('restart');
+$('back10').onclick=()=>command('skip',{seconds:-10});
+$('forward10').onclick=()=>command('skip',{seconds:10});
+$('seek').oninput=()=>{seekDragging=true;$('seekPreview').textContent=fmt(Number($('seek').value));};
+$('seek').onchange=()=>{command('seek',{position:Number($('seek').value)});seekDragging=false;};
+$('seek').onblur=()=>{seekDragging=false;};
+$('jumpForm').onsubmit=event=>{
+ event.preventDefault();
+ const seconds=TeamWatchSync.parseTimestamp($('jumpTime').value);
+ $('jumpError').textContent='';
+ if(seconds===null){$('jumpError').textContent='Enter a time such as 01:23 or 01:02:03.';return;}
+ if(!media){$('jumpError').textContent='Upload a movie first.';return;}
+ if(seconds>media.duration){$('jumpError').textContent=`Choose a time between 00:00 and ${fmt(media.duration)}.`;return;}
+ command('seek',{position:seconds});
+};
 $('offset').onchange=()=>{adjustment=Math.max(-2000,Math.min(2000,Number($('offset').value)||0));$('offset').value=adjustment;localStorage.setItem('tw-offset',adjustment);sync(true);};
 $('volume').oninput=()=>{for(const p of [$('video'),$('audio')])p.volume=Number($('volume').value);$('volumeValue').textContent=`${Math.round(Number($('volume').value)*100)}%`;};
 $('fullscreen').onclick=async()=>{try{if($('video').webkitEnterFullscreen&&!$('video').requestFullscreen)$('video').webkitEnterFullscreen();else await $('video').requestFullscreen();}catch{notice('Full screen is not supported on this browser.');}};

@@ -24,7 +24,7 @@ For a trusted LAN test, set `BIND_ADDRESS=0.0.0.0` and `COOKIE_SECURE=false`, re
 2. Open the same URL on the projector and choose **Video only**. The server sends a video file with no audio track.
 3. Friends join with the viewer PIN and select **Audio only** on their phones, or **Video + audio** to watch on their own screens.
 4. Everyone taps **Connect playback** when the movie is ready. The host does this too if watching or listening on that device. The host can also control the room without connecting local playback.
-5. Any participant can press **Play for everyone** or **Pause everyone**. The host can restart, seek, or press **Sync all devices** to re-align the room at a common timestamp. Late arrivals catch up after connecting playback. A connected device buffering, stopping, or disconnecting pauses the room. Resume manually with Play when active devices are ready.
+5. Any participant can press **Play for everyone** or **Pause everyone**. The host can **Restart movie**, jump **10 seconds** backward/forward, drag the position slider, enter an exact timestamp using **Go to time** (for example `01:23` or `01:02:03`), or press **Sync all devices** to re-align the room at a common timestamp. Late arrivals catch up after connecting playback. A connected device buffering, stopping, or disconnecting pauses the room. Resume manually with Play when active devices are ready.
 6. Keep phone browser pages visible and screens awake. The app requests a screen wake lock where supported. Background playback, locked screens, battery-saving modes, and browser timer throttling can interfere with synchronization. Switching modes or replacing a movie requires tapping Connect playback again.
 
 ## Synchronization and bandwidth
@@ -127,3 +127,5 @@ page offers retry. Playback speed adjustments use a one-second median window and
 hysteresis instead of writing the decoder rate on every 100 ms sample. App assets
 revalidate on reload, and service-worker setup waits for an installing update to
 activate before setting up media playback.
+
+Host navigation preserves the current play/pause state. Ten-second jumps use the server position, so device timing adjustments do not change where the room lands. Slider dragging previews a position and commits the room seek on release.

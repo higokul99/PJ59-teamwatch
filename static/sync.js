@@ -37,7 +37,17 @@
    return this.rate;
   }
  }
- const api = {target, correction, RateController};
+ function parseTimestamp(value){
+  const text=String(value).trim();
+  if(!/^\d+(?::\d{2}){0,2}$/.test(text))return null;
+  const parts=text.split(':').map(Number);
+  if(parts.some(n=>!Number.isSafeInteger(n)))return null;
+  if(parts.length>1&&parts.at(-1)>=60)return null;
+  if(parts.length===3&&parts[1]>=60)return null;
+  const seconds=parts.reduce((sum,n)=>sum*60+n,0);
+  return Number.isSafeInteger(seconds)?seconds:null;
+ }
+ const api = {target, correction, RateController, parseTimestamp};
  if (typeof module !== 'undefined' && module.exports) module.exports = api;
  else root.TeamWatchSync = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
