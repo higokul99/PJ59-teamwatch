@@ -31,7 +31,7 @@ For a trusted LAN test, set `BIND_ADDRESS=0.0.0.0` and `COOKIE_SECURE=false`, re
 
 - The server owns the position, play state, and start timestamp. Play and seek while playing schedule a start 1.5 seconds ahead.
 - Devices sample server clock offset using WebSocket round-trip measurements and the lowest-latency recent sample. A monotonic browser clock avoids local wall-clock jumps.
-- Every 200 ms, the client compares its media time with the shared timeline. Small errors use up to ±3.5% playback-rate adjustment; errors above 350 ms seek to catch up. A slow/buffering device catches up independently rather than pausing the entire room.
+- A deadline timer starts playback at the shared timestamp. Every 100 ms, the client compares its media time with the shared timeline. Small errors use up to ±8% playback-rate adjustment; errors above 800 ms seek to catch up, with a two-second cooldown to avoid repeated decoder stalls. Clock offset is sampled several times immediately on connection. Use Resync this device for an immediate clock refresh and playback correction. A slow/buffering device catches up independently rather than pausing the entire room.
 - ffmpeg produces an H.264 video-only MP4, AAC audio-only M4A, and combined MP4 with fast-start metadata. Tracks use the same input timestamp origin. HTTP byte-range requests let browsers buffer and seek without downloading the whole file. This is progressive, on-demand streaming after preparation, not live transcoding or adaptive HLS.
 - Audio-only clients download approximately 160 kbps plus overhead. Video is capped at 1920 pixels wide, with variable bitrate. Each viewer consumes outbound VPS bandwidth independently.
 - There is **no guarantee of identical acoustic latency**. This is best-effort browser synchronization, not sample-accurate multi-device audio. Bluetooth, hardware, buffering, and mobile browser restrictions introduce delay. Use per-device adjustment (±2000 ms); positive values advance playback to compensate for slow audio output. Start with +150 ms for late Bluetooth audio and adjust by ear. Reported drift measures browser media position, not sound reaching headphones.
@@ -76,3 +76,5 @@ Run all tests including real media conversion without installing FFmpeg on the h
 docker build --target test -t teamwatch:test .
 docker run --rm teamwatch:test
 ```
+
+Browser synchronization regressions can also be run with `node --test tests/sync.test.cjs`. Node.js is installed only in the Docker test stage.

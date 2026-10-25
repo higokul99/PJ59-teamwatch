@@ -2,6 +2,7 @@
 const $ = id => document.getElementById(id);
 let role, ws, roomState, media, mediaKey = '', mode = localStorage.getItem('tw-mode') || 'combined';
 let enabled = false, clockOffset = 0, clockSamples = [], reconnect, pingTimer, leaving = false, connecting = false, uploading = false;
+let startTimer, clockTimers = [], lastSeek = -Infinity, pendingForce = false, playPending = false;
 let adjustment = Number(localStorage.getItem('tw-offset') || 0);
 if (!Number.isFinite(adjustment)) adjustment = 0;
 adjustment = Math.max(-2000, Math.min(2000, adjustment));
@@ -32,20 +33,22 @@ async function enter(){
 function openSocket(){
  clearInterval(pingTimer); clearTimeout(reconnect);
  ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`);
- ws.onopen=()=>{ping(); pingTimer=setInterval(ping,2000);};
+ ws.onopen=()=>{clockSamples=[]; measureClock(); pingTimer=setInterval(ping,2000);};
  ws.onmessage=e=>{
   const data=JSON.parse(e.data);
   if(data.type==='pong'){
    const now=localNow(), rtt=now-data.sent;
+   if(!Number.isFinite(rtt)||rtt<0||rtt>5)return;
    clockSamples.push({rtt,offset:data.server_time-(data.sent+now)/2});
    clockSamples=clockSamples.slice(-15);
    clockOffset=[...clockSamples].sort((a,b)=>a.rtt-b.rtt)[0].offset;
+   scheduleStart();
    $('clockInfo').textContent=`Round trip: ${Math.round(rtt*1000)} ms · Device adjustment: ${adjustment} ms`;
   } else if(data.type==='state') receiveState(data);
   else if(data.type==='error') notice(data.message);
  };
  ws.onclose=e=>{
-  clearInterval(pingTimer); $('connection').textContent='Disconnected';
+  clearInterval(pingTimer); clearTimeout(startTimer); clockTimers.forEach(clearTimeout); $('connection').textContent='Disconnected';
   $('video').pause(); $('audio').pause();
   if(leaving)return;
   if(e.code===1008){notice('Your session ended. Leave the room and join again.');return;}
@@ -54,9 +57,21 @@ function openSocket(){
  ws.onerror=()=>ws.close();
 }
 function ping(){if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'ping',sent:localNow()}));}
+function measureClock(){
+ clockTimers.forEach(clearTimeout);
+ ping(); clockTimers=[150,350,650,1000].map(delay=>setTimeout(ping,delay));
+}
+function scheduleStart(){
+ clearTimeout(startTimer);
+ if(!roomState?.playing||!enabled)return;
+ const wait=(roomState.anchor-serverNow())*1000;
+ if(wait>0)startTimer=setTimeout(()=>{if(serverNow()<roomState.anchor)scheduleStart();else sync();},Math.max(1,Math.min(wait,2147483647)));
+}
 function receiveState(data){
  if(!clockSamples.length)clockOffset=data.server_time-localNow();
+ const changed=roomState?.revision!==data.timeline.revision;
  roomState=data.timeline; media=data.media;
+ if(changed)pendingForce=true;
  $('connection').textContent=`${data.count} connected`;
  $('movieName').textContent=media?.name || 'Your shared cinema';
  if(!uploading)$('uploadStatus').textContent=data.processing.message;
@@ -65,7 +80,7 @@ function receiveState(data){
  $('play').disabled=$('pause').disabled=$('restart').disabled=$('seek').disabled=!media;
  if(media){$('seek').max=media.duration;}
  notice(data.processing.message);
- configureMedia();
+ configureMedia(); scheduleStart(); sync();
 }
 function configureMedia(){
  if(!['audio','video','combined'].includes(mode))mode='combined';
@@ -77,8 +92,9 @@ function configureMedia(){
  if(media&&!media.has_video&&mode!=='audio'){mode='audio';configureMedia();return;}
  const key=media ? `${media.id}:${mode}` : '';
  if(key===mediaKey)return;
- mediaKey=key; enabled=false;
+ mediaKey=key; enabled=false; playPending=false; pendingForce=true; lastSeek=-Infinity; clearTimeout(startTimer);
  for(const el of [$('video'),$('audio')]){el.pause();el.removeAttribute('src');el.load();}
+ $('resync').disabled=!media;
  $('connect').disabled=!media; $('connect').textContent='Connect playback';
  $('connectHint').textContent='Tap to enable playback on this device.';
  $('volume').disabled=mode==='video';
@@ -97,39 +113,50 @@ let wakeLock;
 async function keepAwake(){try{if('wakeLock' in navigator)wakeLock=await navigator.wakeLock.request('screen');}catch{}}
 $('connect').onclick=async()=>{
  if(!media)return;
- const p=player(); connecting=true;
+ const p=player(); connecting=true; pendingForce=true;
  // play() must be called directly from the gesture for mobile autoplay policies.
  try{
-  await p.play(); enabled=true; connecting=false; sync(true); await keepAwake();
+  await p.play(); enabled=true; connecting=false; sync(); scheduleStart(); await keepAwake();
   $('connect').textContent='Playback connected ✓';
   $('connectHint').textContent='Keep this page visible for the best synchronization.';
  }catch(e){enabled=false;notice('Playback could not start. Wait for buffering, then tap Connect playback again.');}
- finally{connecting=false;sync(true);}
+ finally{connecting=false;sync();}
 };
 function targetPosition(){
  if(!roomState||!media)return 0;
- return Math.max(0,Math.min(media.duration,roomState.position+(roomState.playing?Math.max(0,serverNow()-roomState.anchor):0)+adjustment/1000));
+ return TeamWatchSync.target(roomState,media.duration,serverNow(),adjustment);
 }
 function sync(force=false){
+ if(force)pendingForce=true;
  if(!media||!roomState)return;
  const p=player(), target=targetPosition();
  $('time').textContent=`${fmt(target)} / ${fmt(media.duration)}`;
  if(document.activeElement!==$('seek'))$('seek').value=target;
  if(!enabled||connecting){$('syncStatus').textContent='Tap Connect playback';return;}
  if(ws?.readyState!==WebSocket.OPEN){p.pause();return;}
- if(p.readyState<2){$('syncStatus').textContent='Buffering…';return;}
  const playing=roomState.playing&&serverNow()>=roomState.anchor&&target<media.duration;
- const drift=target-p.currentTime;
- if(force||Math.abs(drift)>.35||(!playing&&Math.abs(drift)>.04)){
-  if(!p.seeking)p.currentTime=target;
-  p.playbackRate=1;
- }else p.playbackRate=playing&&Math.abs(drift)>.04?1+Math.max(-.035,Math.min(.035,drift*.12)):1;
- if(playing&&p.paused){
-  p.play().catch(()=>{enabled=false;$('connect').textContent='Reconnect playback';notice('Your browser paused playback. Tap Connect playback to resume.');});
- }else if(!playing&&!p.paused)p.pause();
- $('syncStatus').textContent=!roomState.playing?'Room paused':serverNow()<roomState.anchor?'Starting together…':`Following host · ${Math.round(Math.abs(drift)*1000)} ms drift`;
+ // Apply pause immediately, even when the decoder is buffering.
+ if(!playing&&!p.paused)p.pause();
+ if(p.readyState<2){$('syncStatus').textContent='Buffering…';return;}
+ const decision=TeamWatchSync.correction({target,current:p.currentTime,playing,seeking:p.seeking,force:pendingForce,now:performance.now()/1000,lastSeek});
+ if(p.seeking){$('syncStatus').textContent='Aligning playback…';return;}
+ pendingForce=false;
+ if(decision.seek){
+  lastSeek=performance.now()/1000;
+  p.currentTime=target;
+ }
+ p.playbackRate=decision.rate;
+ if(playing&&p.paused&&!playPending){
+  playPending=true;
+  p.play().catch(()=>{enabled=false;$('connect').textContent='Reconnect playback';notice('Your browser paused playback. Tap Connect playback to resume.');}).finally(()=>{playPending=false;});
+ }
+ const ms=Math.round(Math.abs(decision.drift)*1000);
+ $('syncStatus').textContent=!roomState.playing?'Room paused':serverNow()<roomState.anchor?'Starting together…':ms<=30?'Following host · aligned':`Following host · ${ms} ms ${decision.drift>0?'behind':'ahead'}`;
 }
-setInterval(sync,200);
+// The deadline timer starts playback at the anchor instead of waiting up to
+// 200 ms for the next periodic check. This interval handles ongoing drift.
+setInterval(sync,100);
+$('resync').onclick=()=>{measureClock();pendingForce=true;sync();scheduleStart();};
 function command(action,extra={}){
  if(ws?.readyState!==WebSocket.OPEN){notice('Wait for the room connection.');return;}
  ws.send(JSON.stringify({type:'control',action,...extra}));
@@ -156,6 +183,10 @@ $('upload').onclick=()=>{
  xhr.onerror=()=>{uploading=false;notice('Upload connection failed. Please try again.');$('upload').disabled=false;$('file').disabled=false;$('uploadProgress').hidden=true;};
  xhr.send(file);
 };
-document.addEventListener('visibilitychange',()=>{if(!document.hidden){ping();sync(true);if(enabled)keepAwake();}});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){measureClock();sync(true);scheduleStart();if(enabled)keepAwake();}});
+for(const p of [$('video'),$('audio')]){
+ p.addEventListener('canplay',()=>{if(p===player())sync();});
+ p.addEventListener('seeked',()=>{if(p===player())sync();});
+}
 for(const p of [$('video'),$('audio')])p.addEventListener('error',()=>{if(p.getAttribute('src'))notice('This media could not be loaded. Check your connection, then switch mode or rejoin.');});
 enter().catch(()=>{});

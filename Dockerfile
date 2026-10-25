@@ -14,6 +14,7 @@ CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "
 
 FROM runtime AS test
 USER root
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*
 COPY requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
 COPY --chown=teamwatch:teamwatch tests ./tests
