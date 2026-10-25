@@ -1,0 +1,7 @@
+# Replace with a domain whose DNS points to your VPS.
+watch.example.com {
+    request_body {
+        max_size 10GB
+    }
+    reverse_proxy 127.0.0.1:8000
+}

@@ -1,0 +1,33 @@
+# Secrets and runtime uploads
+.env
+.env.*
+!.env.example
+data/
+
+# Git and local tooling
+.git/
+.idea/
+.vscode/
+.DS_Store
+**/.DS_Store
+**/__pycache__/
+**/*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage*
+htmlcov/
+coverage.xml
+*.egg-info/
+build/
+dist/
+**/*.log
+**/*.tmp
+preview.jpg
+
+# Keep tests and requirements-dev.txt for the Docker test stage.

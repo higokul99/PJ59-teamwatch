@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#101322"><title>TeamWatch · Together, in sync</title><link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script></head>
+<body>
+<header><a class="brand" href="/">◉ <span>TeamWatch</span></a><span class="tag">ONE SCREEN. EVERYONE CONNECTED.</span><button id="logout" class="quiet" hidden>Leave room</button></header>
+<main>
+<section id="login" class="entry">
+ <div class="intro"><span class="eyebrow">YOUR OWN LITTLE CINEMA</span><h1>A big screen.<br>Your headphones.<br><em>One shared moment.</em></h1><p>Watch together, listen from your phone, and let the host keep everyone on the same scene.</p><div class="features"><span>◎ Video only</span><span>♫ Audio only</span><span>◉ Video + audio</span></div></div>
+ <form id="joinForm" class="card"><span class="eyebrow">COME ON IN</span><h2>Join your room</h2><p>Enter the room code and your viewer or host PIN.</p><label for="code">Room code</label><input id="code" name="code" inputmode="numeric" pattern="[0-9]{6,8}" maxlength="8" minlength="6" autocomplete="off" placeholder="Enter room code" required><label for="pin">Four-digit PIN</label><input id="pin" name="pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="current-password" placeholder="••••" required><button type="submit" class="primary">Enter room <span>→</span></button><p id="loginError" class="error" role="alert"></p><small>The host PIN unlocks uploads and playback controls.</small></form>
+</section>
+<section id="room" hidden>
+ <div class="room-heading"><div><span id="roomLabel" class="eyebrow"></span><h1 id="movieName">Your shared cinema</h1></div><span id="connection" class="pill">Connecting…</span></div>
+ <div class="workspace"><div>
+ <div class="screen"><video id="video" playsinline preload="auto" disablepictureinpicture></video><audio id="audio" preload="auto"></audio><div id="placeholder"><div class="orb">♫</div><h2 id="screenTitle">The room is ready.</h2><p id="screenText">Your host will upload a movie or song.</p></div><button id="fullscreen" class="quiet fullscreen" hidden>⛶ Full screen</button></div>
+ <div class="playback-info"><span id="time">00:00 / 00:00</span><span id="syncStatus">Waiting for media</span></div>
+ <div id="hostControls" class="card controls" hidden><div class="section-title"><h2>Host controls</h2><span class="pill">HOST</span></div><div class="transport"><button id="play" class="primary">▶ Play together</button><button id="pause">Ⅱ Pause</button><button id="restart" class="quiet">↶ Restart</button></div><label for="seek">Room position</label><input id="seek" type="range" min="0" max="100" value="0" step="0.1"><small>Play and seek allow 1.5 seconds for devices to line up.</small></div>
+ <div class="notice" id="notice" role="status">Waiting for the host.</div>
+ </div><aside>
+ <div class="card"><span class="eyebrow">THIS DEVICE</span><h2>How are you joining?</h2><div id="modes" class="modes"><button data-mode="combined" class="mode active"><b>◉ Video + audio</b><span>The complete movie on this device</span></button><button data-mode="video" class="mode"><b>▣ Video only</b><span>For your projector or big screen</span></button><button data-mode="audio" class="mode"><b>♫ Audio only</b><span>Plug in your headphones and listen</span></button></div><button id="connect" class="primary" disabled>Connect playback</button><p id="connectHint" class="muted">Tap once when media is ready to enable this device.</p><label for="volume">Volume <span id="volumeValue">100%</span></label><input id="volume" type="range" min="0" max="1" step="0.01" value="1"><small>On iPhone, use the physical volume buttons.</small></div>
+ <details class="card"><summary>Fine-tune synchronization</summary><p>Headphones and projectors add their own delay. Positive values play this device ahead; negative values delay it.</p><label for="offset">Device adjustment (milliseconds)</label><input id="offset" type="number" min="-2000" max="2000" step="10" value="0"><small>Try +150 ms if Bluetooth audio sounds late. This setting stays on this device.</small><p id="clockInfo" class="muted">Measuring connection…</p></details>
+ <div id="uploadPanel" class="card" hidden><span class="eyebrow">HOST LIBRARY</span><h2>Set the scene</h2><p>Upload a movie or a song. The server prepares the tracks before playback.</p><label for="file">Choose media</label><input id="file" type="file" accept="video/*,audio/*,.mkv,.avi,.mov,.flac"><button id="upload">Upload & prepare</button><progress id="uploadProgress" max="100" value="0" hidden></progress><p id="uploadStatus" class="muted"></p><small>Replacing media resets the room. Keep this page open during the upload.</small></div>
+ </aside></div>
+</section>
+</main><footer>Made for movie nights, shared screens, and your favorite people.</footer>
+</body></html>
