@@ -66,7 +66,7 @@ function browserHarness(){
  const nodes=new Map(),timers=[],outbox=[];
  function node(id){
   if(!nodes.has(id))nodes.set(id,{value:0,disabled:false,hidden:false,currentTime:0,readyState:4,paused:true,seeking:false,playbackRate:1,plays:0,
-   classList:{toggle(){}},setAttribute(){},removeAttribute(){},load(){},addEventListener(){},pause(){this.paused=true;},
+   classList:{toggle(){}},setAttribute(name,value){this[name]=value;},removeAttribute(name){delete this[name];},getAttribute(name){return this[name]||null;},load(){},addEventListener(){},pause(){this.paused=true;},
    play(){this.paused=false;this.plays++;return Promise.resolve();}});
   return nodes.get(id);
  }
@@ -196,4 +196,22 @@ test('dragging previews time without seeking until released, then tracking resum
  h.advance(3000);h.run('sync();');assert.equal(slider.value,'25');
  slider.onchange();assert.equal(h.outbox.at(-1).position,25);
  h.run('sync();');assert.equal(slider.value,1.5);
+});
+
+test('processing error takes priority over stale room pause messages',()=>{
+ const h=browserHarness();
+ h.run('mediaKey="fixture:combined";receiveState({server_time:100,count:1,participants:[],timeline:{position:0,playing:false,anchor:100,revision:8,reason:"Old room pause"},media:{id:"fixture",duration:200,name:"Old movie",has_video:true},processing:{status:"error",message:"Replacement failed; old movie retained"}});');
+ assert.equal(h.node('notice').textContent,'Replacement failed; old movie retained');
+ assert.equal(h.node('currentMedia').textContent,'Current media: Old movie');
+ assert.equal(h.node('upload').textContent,'Upload & replace');
+});
+test('clearing media stops both tracks and resets empty room state',()=>{
+ const h=browserHarness();h.node('video').paused=false;h.node('video').src='old.mp4';
+ h.run('mediaKey="old:combined";media=null;roomState.playing=false;configureMedia();');
+ assert.equal(h.node('video').paused,true);
+ assert.equal(h.node('video').getAttribute('src'),null);
+ assert.equal(h.node('audio').getAttribute('src'),null);
+ assert.equal(h.run('enabled'),false);
+ assert.equal(h.node('time').textContent,'00:00 / 00:00');
+ assert.equal(h.node('screenTitle').textContent,'The room is ready.');
 });

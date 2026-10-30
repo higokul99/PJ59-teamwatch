@@ -41,7 +41,7 @@ For a trusted LAN test, set `BIND_ADDRESS=0.0.0.0` and `COOKIE_SECURE=false`, re
 Use the requested shared environment:
 
 ```sh
-cd /Applications/XAMPP/xamppfiles/htdocs/github/7-python/3-teamwatch
+cd /Applications/XAMPP/xamppfiles/htdocs/github/7-python/4-teamwatch
 /Applications/XAMPP/xamppfiles/htdocs/github/7-python/venv/bin/python -m pip install -r requirements.txt
 # Install ffmpeg with your system package manager (ffmpeg and ffprobe must be on PATH).
 /Applications/XAMPP/xamppfiles/htdocs/github/7-python/venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8000 --ws-max-size 4096
@@ -129,3 +129,19 @@ revalidate on reload, and service-worker setup waits for an installing update to
 activate before setting up media playback.
 
 Host navigation preserves the current play/pause state. Ten-second jumps use the server position, so device timing adjustments do not change where the room lands. Slider dragging previews a position and commits the room seek on release.
+
+## Replacing or deleting current media
+
+The host library shows the current filename. **Upload & replace** keeps the current
+movie available while a replacement uploads and converts. On success, the room
+switches to the new file, pauses at zero, clears device readiness, and asks everyone
+to connect playback again. Old media is removed after successful replacement.
+If upload/preparation fails, the current media remains and the host sees an explicit
+error rather than an unrelated old room-pause message.
+
+**Delete current media** is host-only and asks for confirmation. It stops playback
+for everyone, clears the saved current-media record so it cannot reappear on restart,
+removes its prepared server files, and clears connected clients' player sources and
+download cache. Deletion is disabled/rejected while an upload or conversion is
+running, to avoid a background job restoring deleted media. Storage permission
+failures are reported. After deletion, a fresh upload starts from an empty room.

@@ -130,11 +130,14 @@ function receiveState(data){
  $('readiness').textContent=`${devices.filter(p=>p.ready).length}/${devices.length} playback devices ready`;
  $('movieName').textContent=media?.name || 'Your shared cinema';
  if(!uploading)$('uploadStatus').textContent=data.processing.message;
- const busy=uploading||data.processing.status==='processing';
+ const busy=uploading||['uploading','processing','deleting'].includes(data.processing.status);
  $('upload').disabled=busy; $('file').disabled=busy;
+ $('deleteMedia').disabled=busy||!media;
+ $('currentMedia').textContent=media?`Current media: ${media.name}`:'No media in this room.';
+ $('upload').textContent=media?'Upload & replace':'Upload & prepare';
  $('play').disabled=$('pause').disabled=$('restart').disabled=$('seek').disabled=$('syncAll').disabled=$('back10').disabled=$('forward10').disabled=$('jumpTime').disabled=$('jumpButton').disabled=!media;
  if(media){$('seek').max=media.duration;}
- notice(data.timeline.reason||data.processing.message);
+ notice(data.processing.status==='error'||busy?data.processing.message:(data.timeline.reason||data.processing.message));
  configureMedia(); scheduleStart(); sync();
 }
 function configureMedia(){
@@ -159,6 +162,13 @@ function configureMedia(){
  $('placeholder').hidden=!!media&&mode!=='audio';
  $('video').hidden=!media||mode==='audio';
  $('fullscreen').hidden=!media||mode==='audio';
+ if(!media){
+  if(globalThis.TeamWatchDownload)TeamWatchDownload.clear();
+  $('screenTitle').textContent='The room is ready.';$('screenText').textContent='Your host will upload a movie or song.';
+  $('time').textContent='00:00 / 00:00';$('syncStatus').textContent='Waiting for media';
+  $('seek').value=0;$('seekPreview').textContent='00:00';$('jumpError').textContent='';
+  $('downloadProgress').value=0;$('downloadStatus').textContent='No media to download.';
+ }
  if(media){
   const p=player(); p.muted=mode==='video';
   p.src=`/media/${media.id}/${mode==='audio'?'audio.m4a':mode==='video'?'video.mp4':'combined.mp4'}`;
@@ -264,19 +274,33 @@ $('offset').onchange=()=>{adjustment=Math.max(-2000,Math.min(2000,Number($('offs
 $('volume').oninput=()=>{for(const p of [$('video'),$('audio')])p.volume=Number($('volume').value);$('volumeValue').textContent=`${Math.round(Number($('volume').value)*100)}%`;};
 $('fullscreen').onclick=async()=>{try{if($('video').webkitEnterFullscreen&&!$('video').requestFullscreen)$('video').webkitEnterFullscreen();else await $('video').requestFullscreen();}catch{notice('Full screen is not supported on this browser.');}};
 $('logout').onclick=async()=>{try{await api('/api/logout',{});if(globalThis.TeamWatchDownload)await TeamWatchDownload.clear();leaving=true;ws?.close();location.reload();}catch(e){notice(e.message);}};
+$('deleteMedia').onclick=async()=>{
+ if(!media||uploading)return;
+ if(!confirm('Delete current media for everyone? This clears playback and removes the server files.'))return;
+ $('deleteMedia').disabled=true;
+ try{
+  const response=await fetch('/api/media',{method:'DELETE'});
+  const data=await response.json();
+  if(!response.ok)throw Error(data.detail||'Could not delete media.');
+  if(!roomState||data.timeline.revision>=roomState.revision)receiveState(data);
+ }catch(error){notice(error.message);$('uploadStatus').textContent=error.message;$('deleteMedia').disabled=!media;}
+};
 $('upload').onclick=()=>{
  const file=$('file').files[0]; if(!file){notice('Choose a movie or song first.');return;}
- uploading=true;$('upload').disabled=true;$('file').disabled=true;$('uploadProgress').hidden=false;
+ uploading=true;$('upload').disabled=true;$('file').disabled=true;$('deleteMedia').disabled=true;$('uploadProgress').value=0;$('uploadProgress').hidden=false;$('uploadStatus').textContent='Uploading…';
  const xhr=new XMLHttpRequest();xhr.open('POST',`/api/upload?name=${encodeURIComponent(file.name)}`);
  xhr.setRequestHeader('Content-Type','application/octet-stream');
  xhr.upload.onprogress=e=>{if(e.lengthComputable){$('uploadProgress').value=e.loaded/e.total*100;$('uploadStatus').textContent=`Uploading ${Math.round(e.loaded/e.total*100)}%`;}};
- xhr.onload=()=>{
+ xhr.onload=async()=>{
   uploading=false;
   $('uploadProgress').hidden=true;
-  if(xhr.status>=200&&xhr.status<300){notice('Upload complete. Preparing movie tracks…');}
-  else{let message='Upload failed.';try{message=JSON.parse(xhr.responseText).detail||message;}catch{}notice(message);$('upload').disabled=false;$('file').disabled=false;}
+  if(xhr.status>=200&&xhr.status<300){
+   try{receiveState(await api('/api/me'));}
+   catch{notice('Upload received. Check preparation status when the room reconnects.');}
+  }
+  else{let message='Upload failed.';try{message=JSON.parse(xhr.responseText).detail||message;}catch{}notice(message);$('uploadStatus').textContent=message;$('upload').disabled=false;$('file').disabled=false;$('deleteMedia').disabled=!media;}
  };
- xhr.onerror=()=>{uploading=false;notice('Upload connection failed. Please try again.');$('upload').disabled=false;$('file').disabled=false;$('uploadProgress').hidden=true;};
+ xhr.onerror=()=>{uploading=false;const message='Upload connection failed. Check the current media and preparation status before retrying.';notice(message);$('uploadStatus').textContent=message;$('upload').disabled=false;$('file').disabled=false;$('deleteMedia').disabled=!media;$('uploadProgress').hidden=true;};
  xhr.send(file);
 };
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){measureClock();sync(true);scheduleStart();if(enabled)keepAwake();}});

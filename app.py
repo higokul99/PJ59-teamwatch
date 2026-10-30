@@ -103,13 +103,20 @@ async def send(ws, value):
             pass
 
 
+def reset_playback(reason=''):
+    state.update(playing=False, position=0.0, anchor=time.time(),
+                 revision=state['revision'] + 1, reason=reason)
+    for ws in peers:
+        peer_status[ws] = {'active': False, 'ready': False}
+
+
 async def process(source, ident, name):
     global media, processing, upload_busy
     folder = DATA / ident
-    folder.mkdir()
     proc = None
     try:
-        processing = {'status': 'processing', 'message': 'Preparing synchronized video and audio. Large movies can take a while.'}
+        folder.mkdir()
+        processing = {'status': 'processing', 'message': f'Preparing {name[:200]}. The current media stays until replacement is ready.'}
         await broadcast()
         proc = await asyncio.create_subprocess_exec('ffprobe', '-v', 'error', *INPUT_OPTIONS, '-show_format', '-show_streams', '-of', 'json', str(source), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         out, err = await asyncio.wait_for(proc.communicate(), 60)
@@ -144,7 +151,7 @@ async def process(source, ident, name):
         temp.replace(DATA / 'current.json')
         old = media
         media = new_media
-        state.update(playing=False, position=0.0, anchor=time.time(), revision=state['revision'] + 1)
+        reset_playback('New media ready. Playback reset to the beginning; connect playback again.')
         processing = {'status': 'ready', 'message': 'Ready. Connect playback on each device, then press Play.'}
         if old:
             shutil.rmtree(DATA / old['id'], ignore_errors=True)
@@ -155,10 +162,14 @@ async def process(source, ident, name):
         shutil.rmtree(folder, ignore_errors=True)
         raise
     except Exception as exc:
-        processing = {'status': 'error', 'message': str(exc) if isinstance(exc, ValueError) else 'Media processing failed. Check ffmpeg installation and available disk space.'}
+        detail = str(exc) if isinstance(exc, ValueError) else 'Media processing failed. Check ffmpeg installation and available disk space.'
+        processing = {'status': 'error', 'message': detail + (' The current media was not replaced.' if media else ' No media was added.')}
     finally:
-        source.unlink(missing_ok=True)
         upload_busy = False
+        try:
+            source.unlink(missing_ok=True)
+        except OSError:
+            processing['message'] += ' Source upload could not be removed; check storage permissions.'
         await broadcast()
 
 
@@ -275,6 +286,8 @@ async def upload(request: Request):
     ident = secrets.token_hex(12)
     source = DATA / f'{ident}.upload'
     try:
+        processing = {'status': 'uploading', 'message': 'Receiving the upload. Current media will be replaced only after successful preparation.'}
+        await broadcast()
         size = 0
         with source.open('wb') as target:
             async for chunk in request.stream():
@@ -288,10 +301,51 @@ async def upload(request: Request):
         processing = {'status': 'processing', 'message': 'Upload complete. Preparing media…'}
         job = asyncio.create_task(process(source, ident, name))
         return {'ok': True}
-    except BaseException:
+    except BaseException as exc:
         upload_busy = False
-        source.unlink(missing_ok=True)
+        try:
+            source.unlink(missing_ok=True)
+        except OSError:
+            pass
+        detail = str(exc.detail) if isinstance(exc, HTTPException) else 'Upload interrupted. Please try again.'
+        processing = {'status': 'error', 'message': detail + (' Current media is unchanged.' if media else '')}
+        await broadcast()
         raise
+
+
+@app.delete('/api/media')
+async def delete_media(request: Request):
+    global media, processing, upload_busy
+    auth(request, host=True)
+    if upload_busy:
+        raise HTTPException(409, 'Wait for the current upload or preparation to finish before deleting media.')
+    upload_busy = True
+    try:
+        old = media
+        # Remove the restart manifest before clearing the room. A failed unlink
+        # must not make a supposedly deleted movie return after a restart.
+        try:
+            (DATA / 'current.json').unlink(missing_ok=True)
+        except OSError:
+            raise HTTPException(500, 'Could not remove the saved media record. Current media is unchanged; check server storage permissions.')
+        media = None
+        reset_playback('Media deleted. Upload a new movie or song.')
+        processing = {'status': 'deleting', 'message': 'Clearing current media…'}
+        await broadcast()
+        cleanup_error = False
+        if old:
+            try:
+                await asyncio.to_thread(shutil.rmtree, DATA / old['id'])
+            except FileNotFoundError:
+                pass
+            except OSError:
+                cleanup_error = True
+        processing = ({'status': 'error', 'message': 'Room cleared, but old files could not be removed. Check server storage permissions.'}
+                      if cleanup_error else {'status': 'idle', 'message': 'Media deleted. Upload a new movie or song.'})
+        return {'ok': True, **snapshot()}
+    finally:
+        upload_busy = False
+        await broadcast()
 
 
 @app.get('/sw.js')

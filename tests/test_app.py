@@ -6,8 +6,10 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -28,6 +30,7 @@ class RoomTests(unittest.TestCase):
         app.peer_status.clear()
         app.upload_busy = False
         app.processing = {'status': 'idle', 'message': 'Ready'}
+        (app.DATA / 'current.json').unlink(missing_ok=True)
         app.state.update(playing=False, position=0, anchor=100, revision=0)
         self.client = TestClient(app.app)
 
@@ -262,6 +265,135 @@ class RoomTests(unittest.TestCase):
                                       ({'action': 'restart'}, 0)]:
                 ws.send_json({'type': 'control', **command})
                 self.assertEqual(ws.receive_json()['timeline']['position'], expected)
+
+    def test_delete_media_is_host_only_and_clears_disk_and_state(self):
+        self.fake_media()
+        (app.DATA / 'current.json').write_text(json.dumps(app.media))
+        app.state.update(playing=True, position=50, reason='old reason')
+        self.assertEqual(self.client.delete('/api/media', headers=ORIGIN).status_code, 401)
+        self.join()
+        self.assertEqual(self.client.delete('/api/media', headers=ORIGIN).status_code, 403)
+        self.join('9292')
+        self.assertEqual(self.client.delete('/api/media').status_code, 403)
+        response = self.client.delete('/api/media', headers=ORIGIN)
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()['media'])
+        self.assertFalse(app.state['playing'])
+        self.assertEqual(app.state['position'], 0)
+        self.assertFalse((app.DATA / 'current.json').exists())
+        self.assertFalse((app.DATA / 'testmedia').exists())
+        self.assertFalse(app.upload_busy)
+        self.assertEqual(self.client.delete('/api/media', headers=ORIGIN).status_code, 200)
+
+    def test_delete_during_preparation_is_rejected(self):
+        self.fake_media()
+        self.join('9292')
+        app.upload_busy = True
+        response = self.client.delete('/api/media', headers=ORIGIN)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(app.media['id'], 'testmedia')
+        app.upload_busy = False
+
+    def test_failed_manifest_delete_preserves_current_media(self):
+        self.fake_media()
+        self.join('9292')
+        with patch.object(Path, 'unlink', side_effect=PermissionError):
+            response = self.client.delete('/api/media', headers=ORIGIN)
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(app.media['id'], 'testmedia')
+        self.assertFalse(app.upload_busy)
+
+    def test_successful_replacement_resets_room_and_readiness(self):
+        self.fake_media()
+        (app.DATA / 'current.json').write_text(json.dumps(app.media))
+        app.state.update(position=45, playing=True, reason='An old buffering message')
+        peer = object()
+        app.peers[peer] = 'token'
+        app.peer_status[peer] = {'active': True, 'ready': True}
+        ident = 'replacement'
+        source = app.DATA / 'replacement.upload'
+        source.write_bytes(b'media')
+        info = {'format': {'duration': '90'}, 'streams': [{'codec_type': 'audio'}]}
+        async def fake_process(*args, **kwargs):
+            if args[0] == 'ffmpeg':
+                Path(args[-1]).write_bytes(b'prepared audio')
+            return SimpleNamespace(returncode=0, wait=AsyncMock(return_value=0),
+                                   communicate=AsyncMock(return_value=(json.dumps(info).encode(), b'')))
+        with patch.object(app.asyncio, 'create_subprocess_exec', side_effect=fake_process), patch.object(app, 'broadcast', new_callable=AsyncMock):
+            asyncio.run(app.process(source, ident, 'Replacement song'))
+        self.assertEqual(app.media['id'], ident)
+        self.assertEqual(json.loads((app.DATA / 'current.json').read_text())['id'], ident)
+        self.assertEqual(app.state['position'], 0)
+        self.assertFalse(app.state['playing'])
+        self.assertFalse(app.peer_status[peer]['active'])
+        self.assertFalse(app.peer_status[peer]['ready'])
+        self.assertNotIn('old buffering', app.state['reason'])
+        self.assertFalse((app.DATA / 'testmedia').exists())
+        self.assertFalse(source.exists())
+        self.assertFalse(app.upload_busy)
+
+    def test_processing_folder_failure_releases_upload_lock(self):
+        self.fake_media()
+        source = app.DATA / 'mkdir-failed.upload'
+        source.write_bytes(b'media')
+        app.upload_busy = True
+        with patch.object(Path, 'mkdir', side_effect=PermissionError):
+            asyncio.run(app.process(source, 'mkdir-failed', 'New movie'))
+        self.assertEqual(app.processing['status'], 'error')
+        self.assertIn('not replaced', app.processing['message'])
+        self.assertEqual(app.media['id'], 'testmedia')
+        self.assertFalse(app.upload_busy)
+
+    def test_source_cleanup_failure_does_not_lock_future_uploads(self):
+        self.fake_media()
+        source = app.DATA / 'cleanup-failed.upload'
+        source.write_bytes(b'media')
+        app.upload_busy = True
+        with patch.object(app.asyncio, 'create_subprocess_exec', side_effect=FileNotFoundError), patch.object(Path, 'unlink', side_effect=PermissionError):
+            asyncio.run(app.process(source, 'cleanup-failed', 'New movie'))
+        self.assertFalse(app.upload_busy)
+        self.assertIn('Source upload could not be removed', app.processing['message'])
+
+    def test_delete_reports_unremoved_files_after_clearing_room(self):
+        self.fake_media()
+        self.join('9292')
+        with patch.object(app.shutil, 'rmtree', side_effect=PermissionError):
+            response = self.client.delete('/api/media', headers=ORIGIN)
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(app.media)
+        self.assertEqual(response.json()['processing']['status'], 'error')
+        self.assertFalse(app.upload_busy)
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe unavailable')
+    def test_real_upload_replace_and_delete_through_api(self):
+        fixture = app.DATA / 'api-fixture.mkv'
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=size=160x90:rate=12',
+                        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '1',
+                        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', str(fixture)], check=True)
+        with self.client:
+            self.join('9292')
+            previous = None
+            for name in ('First movie', 'Replacement movie'):
+                response = self.client.post('/api/upload', params={'name': name}, content=fixture.read_bytes(), headers=ORIGIN)
+                self.assertEqual(response.status_code, 200, response.text)
+                for _ in range(100):
+                    data = self.client.get('/api/me').json()
+                    if data['processing']['status'] not in ('uploading', 'processing'):
+                        break
+                    time.sleep(.05)
+                self.assertEqual(data['processing']['status'], 'ready', data['processing'])
+                self.assertEqual(data['media']['name'], name)
+                self.assertFalse(data['timeline']['playing'])
+                self.assertEqual(data['timeline']['position'], 0)
+                if previous:
+                    self.assertNotEqual(data['media']['id'], previous)
+                    self.assertFalse((app.DATA / previous).exists())
+                previous = data['media']['id']
+            response = self.client.delete('/api/media', headers=ORIGIN)
+            self.assertEqual(response.status_code, 200)
+            self.assertIsNone(self.client.get('/api/me').json()['media'])
+            self.assertFalse((app.DATA / previous).exists())
+            self.assertFalse((app.DATA / 'current.json').exists())
 
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe unavailable')
     def test_actual_movie_and_audio_conversion(self):

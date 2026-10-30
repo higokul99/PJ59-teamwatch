@@ -10,3 +10,5 @@
 input:not([type=range]){background:#101010}input[type=file]::file-selector-button{background:#292929;color:var(--text);border:1px solid #414141;border-radius:6px;padding:6px 10px;margin-right:10px;cursor:pointer}
 .playback-heading{align-items:flex-start;gap:16px;flex-wrap:wrap}.playback-heading h2{margin-top:6px}.room-status{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-left:auto;max-width:100%}.room-status .pill{background:#202020;text-align:left;white-space:normal}.room-status .connection-pill{color:var(--text);border-color:#3a3a3a}.status-help{display:block;color:var(--muted);margin-top:2px}
 @media(max-width:900px){.room-status{margin-left:0}.playback-heading{gap:4px}.room-status .pill{font-size:11px;padding:7px 10px}}
+
+#deleteMedia{width:100%;margin:10px 0 14px;border-color:#66591e;color:var(--accent)}.current-media{overflow-wrap:anywhere;color:var(--text);font-size:13px}#uploadStatus{overflow-wrap:anywhere}
