@@ -1,8 +1,74 @@
 # TeamWatch
 
-For the Metora VPS layout and Nginx deployment, see [deploy/README.md](deploy/README.md).
+TeamWatch is a private, real-time synchronized media streaming server. It is built for movie nights where:
 
-One private room for a projector and everyone's headphones. Python/FastAPI serves a responsive browser interface, protected media, and a shared playback timeline over WebSockets.
+1. **Projector / TV**: Plays video only (muted / no sound track).
+2. **Personal Devices**: Participants listen to audio only on their phones with headphones, or watch video + audio on personal screens.
+3. **Authoritative Timeline**: The server maintains a synchronized master timeline over WebSockets, keeping all devices aligned within milliseconds using smooth, dynamic playback-rate adjustments ($\pm 8\%$) without audible skipping.
+
+For the Metora VPS layout and Nginx deployment, see [docs/deployment/README.md](docs/deployment/README.md).
+
+---
+
+## System Architecture & Tech Stack
+
+### Backend
+- **Framework & Runtime**: Python 3.11+ with [FastAPI](https://fastapi.tiangolo.com/) (0.141.x) and [Starlette](https://www.starlette.io/) (1.6.x) running on [Uvicorn](https://www.uvicorn.org/) (0.52.x).
+- **Real-Time Communication**: Native Starlette WebSockets (`/ws`) for bidirectional timeline events, NTP-style monotonic clock offset calculation, and room state broadcasts.
+- **Media Pipeline**: FFmpeg & FFprobe subprocess pipeline ([media_pipeline.py](media_pipeline.py)) producing incremental 4-second fragmented MP4 (`fmp4`) HLS event streams (`.m3u8`). Stream-copies compatible H.264 video and AAC audio to avoid full re-encoding. Supports instant playback startup (~8 seconds of segments) while background encoding continues.
+- **State Management & Storage**:
+  - **In-Memory**: Room play/pause state, active timeline anchor, connected peers, and IP rate limits live in memory (single-worker architecture).
+  - **Filesystem**: Uploaded sources, generated HLS segments, and diagnostic conversion logs persist under `./data/` (`DATA_DIR`).
+  - **Zero Database**: No SQL or ORM dependencies; runs entirely on disk and in-memory structures.
+- **Security & Authentication**:
+  - Dual-role authentication (`host` vs `viewer`) verified via PINs (`ROOM_CODE`, `HOST_PIN`, `VIEWER_PIN`).
+  - HMAC-SHA256 signed session cookies with 24-hour TTL.
+  - Brute-force protection: in-memory IP rate limiting (10 failed attempts / 5 minutes).
+  - CSRF protection: strict same-origin verification on all mutation endpoints.
+
+### Frontend
+- **Architecture**: Lightweight, vanilla Single Page Application (SPA) with zero external JavaScript framework, build step, or npm dependencies.
+- **Markup & Styling**: Semantic HTML5 ([index.html](static/index.html)) with a responsive, mobile-first dark-mode stylesheet ([style.css](static/style.css)).
+- **Client Modules** (`static/`):
+  - [`app.js`](static/app.js): Core application UI controller, join/host modal management, button interactions, and upload workflows.
+  - [`sync.js`](static/sync.js): High-precision clock synchronization, round-trip NTP-style offset tracking, and dynamic drift correction ($\pm 8\%$ speed adjustments).
+  - [`player.js`](static/player.js): HTML5 `<video>` / `<audio>` abstraction layer.
+  - [`download.js`](static/download.js) & [`cache-core.js`](static/cache-core.js): Progressive download engine storing chunks into browser IndexedDB.
+  - [`sw.js`](static/sw.js): Service Worker intercepting media byte-range requests and HLS segment downloads for local offline/ahead playback.
+  - [`vendor/hls-1.7.4.min.js`](static/vendor/): Vendored HLS.js client bundle for browsers lacking native HLS Media Source Extensions.
+
+### DevOps & Infrastructure
+- **Containerization**: Multi-stage [Dockerfile](Dockerfile) bundling Python, FFmpeg, and Node.js (for test runner), orchestrated via [compose.yaml](compose.yaml).
+- **Reverse Proxy**: Production-ready configurations for Caddy ([Caddyfile.example](Caddyfile.example)) or Nginx ([docs/deployment/nginx.conf.template](docs/deployment/nginx.conf.template)), handling WebSocket upgrades and up to 10 GiB upload limits (`MAX_UPLOAD_MB`).
+
+---
+
+## Project Structure
+
+```text
+4-teamwatch/
+├── app.py                  # FastAPI application, REST endpoints, WebSocket hub, session auth
+├── media_pipeline.py       # FFmpeg probe & incremental HLS fMP4 segmentation pipeline
+├── requirements.txt        # Production Python dependencies (fastapi, starlette, uvicorn)
+├── requirements-dev.txt    # Development & testing dependencies
+├── Dockerfile              # Multi-stage container build with FFmpeg & Node.js test environment
+├── compose.yaml            # Docker Compose service definition
+├── static/                 # Frontend assets (served directly by FastAPI)
+│   ├── index.html          # Main application UI markup
+│   ├── style.css           # Responsive mobile-friendly dark theme
+│   ├── app.js              # UI controller and room event handlers
+│   ├── sync.js             # Real-time WebSocket clock sync and playback rate controller
+│   ├── player.js           # Media element wrapper
+│   ├── download.js         # Pre-download manager
+│   ├── cache-core.js       # IndexedDB storage utilities
+│   ├── sw.js               # Service Worker for progressive caching
+│   └── vendor/             # Vendored client dependencies (hls.js)
+├── docs/deployment/        # Production deployment scripts and Nginx configuration
+├── docs/                   # Specifications, PRDs, architecture notes, and developer guides
+└── tests/                  # Test suites (Python unittest + Node.js browser sync tests)
+```
+
+---
 
 ## Quick start with Docker
 
@@ -20,7 +86,7 @@ For a trusted LAN test, set `BIND_ADDRESS=0.0.0.0` and `COOKIE_SECURE=false`, re
 
 ## Movie night
 
-1. Join using the host PIN. Choose a file, then **Upload & prepare**. Wait until preparation finishes. Most formats ffmpeg can decode are accepted, including MKV; an audio track is required. Audio-only files are supported too.
+1. Join using the host PIN. Choose a file, then **Upload & prepare**. Playback becomes available once the first playable segments are ready; the rest prepares in the background. Watch the preparation progress bar. Most formats ffmpeg can decode are accepted, including MKV; an audio track is required. Audio-only files are supported too.
 2. Open the same URL on the projector and choose **Video only**. The server sends a video file with no audio track.
 3. Friends join with the viewer PIN and select **Audio only** on their phones, or **Video + audio** to watch on their own screens.
 4. Everyone taps **Connect playback** when the movie is ready. The host does this too if watching or listening on that device. The host can also control the room without connecting local playback.
@@ -32,7 +98,7 @@ For a trusted LAN test, set `BIND_ADDRESS=0.0.0.0` and `COOKIE_SECURE=false`, re
 - The server owns the position, play state, and start timestamp. Play and seek while playing schedule a start 1.5 seconds ahead.
 - Devices sample server clock offset using WebSocket round-trip measurements and the lowest-latency recent sample. A monotonic browser clock avoids local wall-clock jumps.
 - A deadline timer starts playback at the shared timestamp. Every 100 ms, the client compares its media time with the shared timeline. Small errors use up to ±8% playback-rate adjustment, smoothed over one second with hysteresis so a coarse browser clock does not repeatedly reset playback speed. Normal playback no longer triggers repeated hard seeks, which can interrupt phone audio. Explicit sync/seek commands and initial connection can reposition playback. Clock offset is sampled several times immediately on connection. Use Resync this device for a local correction, or the host’s Sync all devices to schedule a new room-wide anchor. Persistent buffering is debounced and pauses everyone; readiness reports prevent resuming while active devices are unready. New seeks have a grace period so ordinary decoder activity does not pause the room. Resume manually with Play when ready.
-- ffmpeg produces an H.264 video-only MP4, AAC audio-only M4A, and combined MP4 with fast-start metadata. Tracks use the same input timestamp origin. HTTP byte-range requests let browsers buffer and seek without downloading the whole file. This is progressive, on-demand streaming after preparation, not live transcoding or adaptive HLS.
+- New uploads use event HLS playlists with four-second fragmented-MP4 segments. Compatible 8-bit H.264 video up to 1080p is copied without video re-encoding; other video is converted once to H.264. AAC-LC audio is copied where possible. Video-only and audio-only playlists contain only their respective tracks; combined mode references both without creating a duplicate full movie. Playlists retain segments from the beginning and become final when preparation completes. Supported browsers use the pinned, vendored hls.js player, with native HLS as a fallback on devices without Media Source Extensions. Older prepared MP4/M4A media still plays normally.
 - Audio-only clients download approximately 160 kbps plus overhead. Video is capped at 1920 pixels wide, with variable bitrate. Each viewer consumes outbound VPS bandwidth independently.
 - There is **no guarantee of identical acoustic latency**. This is best-effort browser synchronization, not sample-accurate multi-device audio. Bluetooth, hardware, buffering, and mobile browser restrictions introduce delay. Use per-device adjustment (±2000 ms); positive values advance playback to compensate for slow audio output. Start with +150 ms for late Bluetooth audio and adjust by ear. Reported drift measures browser media position, not sound reaching headphones.
 
@@ -51,8 +117,8 @@ Local Python reads environment variables, not `.env` automatically. Defaults wor
 
 ## Operations
 
-- Uploads default to a 10 GiB limit and stream to disk with bounded memory. Only one upload/conversion runs at a time. Preparation can take minutes to hours depending on movie length and VPS CPU. ffmpeg video encoding is limited to two threads.
-- Allow several times the upload size in free storage: source, video, audio, combined output, and the previous movie may coexist during conversion. The source is deleted after preparation. Successfully replaced media is deleted; failed conversion folders/logs remain for diagnosis and can be manually cleaned when idle.
+- Uploads default to a 10 GiB limit and stream to disk with bounded memory. Only one upload/conversion runs at a time. Full preparation can take minutes to hours, but playback opens after approximately eight seconds of complete segments exist (or the entire clip for shorter files). The progress bar shows the prepared percentage, playable duration, and preparation speed. Startup is a target rather than an unconditional two-minute guarantee: upload time, codec, storage, and VPS capacity still matter. ffmpeg video encoding is limited to two threads.
+- Allow several times the upload size in free storage: the source, video/audio segments, and the previous movie may coexist briefly before the first playable segments replace it. The source is deleted after preparation. Successfully replaced media is deleted; failed conversion folders/logs remain for diagnosis and can be manually cleaned when idle.
 - The Docker named volume retains the prepared movie across container restarts. Playback restarts paused at zero; interrupted uploads/conversions are not resumed. Repeated abrupt shutdowns can leave orphaned files needing cleanup.
 - Sessions expire after 24 hours. Set a stable random `SESSION_SECRET` to preserve signed sessions across restarts; leaving it empty generates a new secret each startup. Logout revokes the session in memory and disconnects its sockets. Rotate the secret to invalidate all sessions.
 - Host/viewer PINs are shared credentials for a small trusted group. Login is rate-limited per source IP (10 failed attempts/5 minutes), media requires a session, mutations require same-origin requests, and only hosts can upload, seek, restart, or sync all devices. All joined participants can play/pause the room. Behind a proxy, configure trusted proxy IPs correctly to preserve client IP rate limiting. Default proxy trust is loopback only.
@@ -81,8 +147,7 @@ Browser synchronization regressions can also be run with `node --test tests/*.te
 
 ## Download ahead on each device
 
-On HTTPS (or localhost), the browser downloads the selected track sequentially in
-1 MiB chunks from start to end, into IndexedDB through a service worker. Native
+On HTTPS (or localhost), the browser downloads the selected media into IndexedDB through a service worker. HLS initialization/segment files are saved as they become available, from the beginning; combined mode interleaves audio/video files. Storage/network reads are bounded in 1 MiB chunks. Legacy MP4 tracks also use the existing sequential byte-range cache. Native
 media range requests read those same chunks; missing chunks are fetched on demand.
 Playback can start while downloading continues. Progress shows how much of the
 selected track is saved; **Fully downloaded** means the sequential download
@@ -133,15 +198,44 @@ Host navigation preserves the current play/pause state. Ten-second jumps use the
 ## Replacing or deleting current media
 
 The host library shows the current filename. **Upload & replace** keeps the current
-movie available while a replacement uploads and converts. On success, the room
-switches to the new file, pauses at zero, clears device readiness, and asks everyone
+movie available while a replacement uploads and its first segments prepare. Once playable, the room
+switches to the new segmented stream after the first playable portion is ready, pauses at zero, clears device readiness, and asks everyone
 to connect playback again. Old media is removed after successful replacement.
-If upload/preparation fails, the current media remains and the host sees an explicit
-error rather than an unrelated old room-pause message.
+If preparation fails before the new movie is playable, the previous movie remains. If background preparation fails after switching, the room pauses, retains the prepared portion, and shows an error; reupload to prepare the entire file.
 
 **Delete current media** is host-only and asks for confirmation. It stops playback
 for everyone, clears the saved current-media record so it cannot reappear on restart,
 removes its prepared server files, and clears connected clients' player sources and
-download cache. Deletion is disabled/rejected while an upload or conversion is
-running, to avoid a background job restoring deleted media. Storage permission
+download cache. Deletion waits during upload/initial preparation, but is allowed once the new movie is playable: it cancels its remaining background encoder before clearing the room, preventing the job from restoring deleted media. Storage permission
 failures are reported. After deletion, a fresh upload starts from an empty room.
+
+## Fast-start preparation and progress
+
+The host uploads the complete source file first. Preparation then publishes the
+first playable HLS segments instead of waiting for the entire movie to convert.
+The **Movie preparation** progress bar reports actual completed-segment duration,
+percentage, and encoder speed. There is no simulated progress timer. Seeking is
+restricted to prepared positions while the rest is being generated. Finishing
+background preparation does not reload the player or reset the room timeline.
+
+For a common H.264/AAC 480p MP4, the fast path repackages compressed data instead
+of re-encoding every frame. This is intended to make the movie playable in seconds
+rather than waiting for its two-hour runtime to process. A guaranteed total wait
+under two minutes is not possible for every codec/VPS/network; upload time is
+separate, and an encoder slower than playback can still require buffering pauses.
+
+A preparation job interrupted by restart is not automatically resumed. Any
+published portion remains available and is labeled interrupted; upload again for
+the full movie. Old fully prepared MP4/M4A files are still supported by this release.
+An older application release cannot play the new HLS layout; rolling back across
+this change requires restoring the previous media backup or uploading again.
+
+Reference: [FFmpeg HLS muxer](https://ffmpeg.org/ffmpeg-formats.html#hls),
+[hls.js](https://github.com/video-dev/hls.js). The pinned hls.js 1.7.4 bundle and
+license are checked into `static/vendor/`, so browser playback needs no CDN.
+
+## Admin portal
+
+Open `/admin` to manage rooms, host/participant accounts, passcodes, uploaded media and live playback. Initialize the dedicated administrator password with `python3 -m admin_portal set-password` (or `docker compose exec teamwatch python -m admin_portal set-password`). The username is `hellometora@gmail.com`; no default admin password is supplied.
+
+See [Admin portal setup and operation](docs/project/admin-portal/README.md) for persistence, recovery, API architecture and verification details. Existing room settings are imported once and subsequently managed in the portal.

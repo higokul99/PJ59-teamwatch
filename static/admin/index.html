@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TeamWatch · Admin</title><link rel="stylesheet" href="/static/admin/style.css"><script defer src="/static/admin/app.js"></script></head>
+<body>
+<div id="notice" role="status" aria-live="polite" hidden></div>
+<section id="login" class="login-wrap">
+ <form id="loginForm" class="login-card">
+  <a class="brand" href="/">◉ TeamWatch <span>ADMIN</span></a>
+  <p class="eyebrow">YOUR CONTROL ROOM</p><h1>Welcome back.</h1><p class="muted">Manage your rooms, people, and shared screenings.</p>
+  <label>Email<input name="username" type="email" autocomplete="username" required placeholder="hellometora@gmail.com"></label>
+  <label>Password<input name="password" type="password" autocomplete="current-password" required minlength="8" maxlength="16"></label>
+  <button class="primary" type="submit">Sign in →</button>
+  <details><summary>First sign-in or forgotten password?</summary><p>On the server, run <code>python -m admin_portal set-password</code>. Use 8–16 characters including uppercase, lowercase, a number, and a special character.</p></details>
+ </form>
+</section>
+<div id="portal" hidden>
+ <aside><a class="brand" href="/admin">◉ TeamWatch <span>ADMIN</span></a><p class="nav-label">WORKSPACE</p><nav aria-label="Administration"><button data-tab="overview" class="selected">◫ Overview</button><button data-tab="rooms">▣ Rooms</button><button data-tab="users">♙ Accounts</button><button data-tab="media">▤ Media library</button><button data-tab="security">⚙ Security & activity</button></nav><div class="aside-bottom"><span class="connection" id="connection">Connecting…</span><a href="/" target="_blank" rel="noopener">Open viewer portal ↗</a></div></aside>
+ <div class="workspace"><header><span>Workspace / <strong id="breadcrumb">Overview</strong></span><div><span class="admin-email">hellometora@gmail.com</span><button id="logout">Sign out</button></div></header>
+ <main>
+  <section id="overview" class="panel"><div class="heading"><div><p class="eyebrow">ALL SYSTEMS, ONE PLACE</p><h1>Your screening rooms.</h1><p class="muted">A live view of the people and media bringing everyone together.</p></div><button class="primary" data-create="room">+ New room</button></div><div class="metrics" id="metrics"></div><div class="section-heading"><h2>Room activity</h2><span class="muted">Updates live</span></div><div id="roomCards" class="room-grid"></div><div class="section-heading"><h2>Connected devices</h2><span class="muted">Reported by the viewer</span></div><div id="devices" class="table-wrap"></div></section>
+  <section id="rooms" class="panel" hidden><div class="heading"><div><p class="eyebrow">WORKSPACE</p><h1>Rooms</h1><p class="muted">Create spaces, update room codes, and control access.</p></div><button class="primary" data-create="room">+ New room</button></div><input id="roomSearch" class="search" type="search" aria-label="Search rooms" placeholder="Search rooms by name or code…"><div id="roomTable" class="table-wrap"></div></section>
+  <section id="users" class="panel" hidden><div class="heading"><div><p class="eyebrow">PEOPLE & ACCESS</p><h1>Accounts</h1><p class="muted">Manage hosts and participants. Passcodes are stored securely and never displayed.</p></div><button class="primary" data-create="user">+ New account</button></div><div id="userTable" class="table-wrap"></div></section>
+  <section id="media" class="panel" hidden><div class="heading"><div><p class="eyebrow">SHARED SCREENINGS</p><h1>Media library</h1><p class="muted">Upload the next screening or remove media from a room.</p></div><button class="danger" id="clearAll">Delete all rooms’ media</button></div><div id="mediaCards" class="room-grid"></div></section>
+  <section id="security" class="panel" hidden><div class="heading"><div><p class="eyebrow">ADMINISTRATION</p><h1>Security & activity</h1><p class="muted">Keep your credentials current and review administrative changes.</p></div></div><form id="passwordForm" class="card narrow"><h2>Change admin password</h2><p class="muted">8–16 characters, including uppercase, lowercase, a number and a special character. Changing it signs out all admin sessions.</p><label>Current password<input name="current_password" type="password" autocomplete="current-password" required></label><label>New password<input name="new_password" type="password" minlength="8" maxlength="16" autocomplete="new-password" required></label><button class="primary">Update password</button></form><div class="section-heading"><h2>Recent activity</h2><button id="refreshAudit">Refresh</button></div><div id="audit" class="table-wrap"></div></section>
+ </main><footer>TeamWatch administration <span>Made for shared moments.</span></footer></div>
+</div>
+<dialog id="editor"><form id="editorForm"><div class="dialog-heading"><h2 id="editorTitle"></h2><button type="button" data-close="editor" aria-label="Close">×</button></div><div id="editorFields"></div><p id="editorError" class="error" role="alert"></p><div class="dialog-actions"><button type="button" data-close="editor">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></dialog>
+<dialog id="confirm"><form id="confirmForm"><div class="dialog-heading"><h2 id="confirmTitle">Confirm deletion</h2><button type="button" data-close="confirm" aria-label="Close">×</button></div><p id="confirmMessage"></p><label id="confirmLabel" hidden>Type CONFIRM to continue<input id="confirmText" autocomplete="off"></label><p id="confirmError" class="error" role="alert"></p><div class="dialog-actions"><button type="button" data-close="confirm">Cancel</button><button id="confirmSubmit" type="submit" class="danger">Delete permanently</button></div></form></dialog>
+<input type="file" id="uploadFile" accept="video/*,audio/*" hidden>
+</body></html>

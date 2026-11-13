@@ -1,4 +1,4 @@
-"""TeamWatch: one room, one authoritative timeline, three device modes."""
+"""TeamWatch room runtime: one authoritative timeline and three device modes per room."""
 import asyncio
 import hashlib
 import hmac
@@ -14,11 +14,13 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from media_pipeline import (STARTUP_SECONDS, available_seconds, build_command, finish_partial, video_stream, write_master)
+
 BASE = Path(__file__).resolve().parent
-DATA = Path(os.getenv('DATA_DIR', str(BASE / 'data')))
+DATA = Path(globals().get('ROOM_DATA', os.getenv('DATA_DIR', str(BASE / 'data'))))
 DATA.mkdir(parents=True, exist_ok=True)
 ROOM_CODE = os.getenv('ROOM_CODE', '8889292')
 VIEWER_PIN = os.getenv('VIEWER_PIN', '8989')
@@ -37,13 +39,15 @@ peers = {}
 peer_status = {}
 job = None
 upload_busy = False
+deleting = False
+preparing_id = None
 media = None
 processing = {'status': 'idle', 'message': 'Upload a movie to begin.'}
 state = {'playing': False, 'position': 0.0, 'anchor': time.time(), 'revision': 0}
 
 
-def token_for(role):
-    payload = f'{role}:{int(time.time()) + TTL}:{secrets.token_hex(16)}'
+def token_for(role, account=''):
+    payload = f'{role}:{int(time.time()) + TTL}:{secrets.token_hex(16)}{account}'
     signature = hmac.new(SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f'{payload}:{signature}'
 
@@ -54,6 +58,8 @@ def role_for(token):
         payload = f'{role}:{expiry}:{nonce}'
         expected = hmac.new(SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
         if role in ('host', 'viewer') and int(expiry) > time.time() and token not in sessions_revoked and hmac.compare_digest(expected, signature):
+            if globals().get('access_check') and not access_check(role, nonce):
+                return None
             return role
     except (ValueError, AttributeError, TypeError):
         pass
@@ -110,61 +116,144 @@ def reset_playback(reason=''):
         peer_status[ws] = {'active': False, 'ready': False}
 
 
+def save_media(value):
+    temporary = DATA / 'current.tmp'
+    temporary.write_text(json.dumps(value))
+    temporary.replace(DATA / 'current.json')
+
+
+async def read_encoder_progress(stream, metrics):
+    while line := await stream.readline():
+        key, _, value = line.decode(errors='replace').strip().partition('=')
+        if key == 'speed':
+            try:
+                speed = float(value.rstrip('x'))
+                if math.isfinite(speed) and speed > 0:
+                    metrics['speed'] = speed
+            except ValueError:
+                pass
+
+
 async def process(source, ident, name):
-    global media, processing, upload_busy
+    global media, processing, upload_busy, preparing_id
     folder = DATA / ident
     proc = None
+    reader = None
+    published = False
+    candidate = None
+    preparing_id = ident
+    started = time.monotonic()
     try:
         folder.mkdir()
-        processing = {'status': 'processing', 'message': f'Preparing {name[:200]}. The current media stays until replacement is ready.'}
+        processing = {'status': 'processing', 'message': 'Inspecting media and preparing the first playable segments.',
+                      'percent': 0, 'prepared_seconds': 0, 'playable': False, 'media_id': ident}
         await broadcast()
         proc = await asyncio.create_subprocess_exec('ffprobe', '-v', 'error', *INPUT_OPTIONS, '-show_format', '-show_streams', '-of', 'json', str(source), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, err = await asyncio.wait_for(proc.communicate(), 60)
+        out, _ = await asyncio.wait_for(proc.communicate(), 60)
         if proc.returncode:
             raise ValueError('The uploaded file could not be read as media.')
         info = json.loads(out)
         duration = float(info['format']['duration'])
-        has_video = any(s['codec_type'] == 'video' for s in info['streams'])
-        has_audio = any(s['codec_type'] == 'audio' for s in info['streams'])
-        if not has_audio or not math.isfinite(duration) or duration <= 0:
+        has_video = video_stream(info) is not None
+        if not any(s['codec_type'] == 'audio' for s in info['streams']) or not math.isfinite(duration) or duration <= 0:
             raise ValueError('Choose a movie or song with an audio track and a finite duration.')
-        # All outputs share the input timestamp origin. Preserve relative A/V offsets.
-        args = ['ffmpeg', '-nostdin', '-y', '-v', 'error', '-copyts', '-start_at_zero', *INPUT_OPTIONS, '-i', str(source)]
-        if has_video:
-            args += ['-map', '0:v:0', '-an', '-vf', "scale=w='trunc(min(1920,iw)/2)*2':h=-2", '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-threads', '2', '-movflags', '+faststart', str(folder / 'video.mp4')]
-        args += ['-map', '0:a:0', '-vn', '-af', 'aresample=async=1:first_pts=0', '-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-movflags', '+faststart', str(folder / 'audio.m4a')]
-        # Log to disk, not RAM; ffmpeg diagnostics can be large for damaged inputs.
+        args, copied = build_command(source, folder, info, INPUT_OPTIONS)
+        write_master(folder, has_video)
+        candidate = {'id': ident, 'name': name[:200], 'duration': duration, 'has_video': has_video,
+                     'format': 'hls', 'complete': False, 'preparing': True, 'available_duration': 0}
+        metrics = {}
+        last_update = -1
+
+        async def update(done=False):
+            nonlocal published, last_update
+            global media, processing
+            available = min(duration, await asyncio.to_thread(available_seconds, folder, has_video))
+            candidate['available_duration'] = duration if done else available
+            candidate['complete'] = done
+            candidate['preparing'] = not done
+            ready = available >= min(STARTUP_SECONDS, duration) or (done and available > 0)
+            if ready and not published:
+                old = media
+                candidate['startup_seconds'] = round(time.monotonic() - started, 2)
+                write_master(folder, has_video)
+                save_media(candidate)
+                media = candidate
+                reset_playback('First segments ready. Connect playback; the rest prepares in the background.')
+                published = True
+                if old and old['id'] != ident:
+                    await asyncio.to_thread(shutil.rmtree, DATA / old['id'], True)
+            if published:
+                media = candidate
+                if int(available) != last_update or done:
+                    save_media(candidate)
+            percent = 100 if done else min(99.9, available / duration * 100)
+            message = ('Fully prepared. All positions are available.' if done else
+                       ('Ready to play; remaining segments are preparing in the background.' if published else
+                        'Preparing the first playable segments. Compatible video is copied without re-encoding.' if copied else
+                        'Preparing the first playable segments; video is being converted for browser compatibility.'))
+            processing = {'status': 'ready' if done else 'processing', 'message': message,
+                          'percent': percent, 'prepared_seconds': duration if done else available,
+                          'total_seconds': duration, 'playable': published, 'speed': metrics.get('speed'),
+                          'elapsed_seconds': round(time.monotonic() - started),
+                          'video_copied': copied, 'startup_seconds': candidate.get('startup_seconds'), 'media_id': ident}
+            if int(available) != last_update or done:
+                last_update = int(available)
+                await broadcast()
+
         with (folder / 'conversion.log').open('wb') as log:
-            proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL, stderr=log)
+            proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=log)
+            reader = asyncio.create_task(read_encoder_progress(proc.stdout, metrics))
+            while proc.returncode is None:
+                await update()
+                await asyncio.sleep(.25)
             await proc.wait()
+            await reader
         if proc.returncode:
-            raise ValueError('Conversion failed. Try another file; see the server conversion log.')
-        if has_video:
-            with (folder / 'conversion.log').open('ab') as log:
-                proc = await asyncio.create_subprocess_exec('ffmpeg', '-nostdin', '-y', '-v', 'error', '-copyts', '-i', str(folder / 'video.mp4'), '-i', str(folder / 'audio.m4a'), '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy', '-movflags', '+faststart', str(folder / 'combined.mp4'), stdout=asyncio.subprocess.DEVNULL, stderr=log)
-                await proc.wait()
-            if proc.returncode:
-                raise ValueError('Could not combine the movie tracks.')
-        new_media = {'id': ident, 'name': name[:200], 'duration': duration, 'has_video': has_video}
-        temp = DATA / 'current.tmp'
-        temp.write_text(json.dumps(new_media))
-        temp.replace(DATA / 'current.json')
-        old = media
-        media = new_media
-        reset_playback('New media ready. Playback reset to the beginning; connect playback again.')
-        processing = {'status': 'ready', 'message': 'Ready. Connect playback on each device, then press Play.'}
-        if old:
-            shutil.rmtree(DATA / old['id'], ignore_errors=True)
+            raise ValueError('Background preparation failed. Check the conversion log and try another upload.')
+        if await asyncio.to_thread(available_seconds, folder, has_video) <= 0:
+            raise ValueError('No playable media segments were produced.')
+        await update(done=True)
     except asyncio.CancelledError:
         if proc and proc.returncode is None:
             proc.kill()
             await proc.wait()
-        shutil.rmtree(folder, ignore_errors=True)
+        processing = {'status': 'error', 'message': 'Preparation interrupted. Upload again to prepare the whole movie.',
+                      'percent': processing.get('percent', 0), 'playable': published, 'media_id': ident}
+        if published:
+            candidate['preparing'] = False
+            candidate['complete'] = False
+            reset_playback('Preparation interrupted. Only the prepared portion is available; upload again to finish.')
+            try:
+                finish_partial(folder, candidate['has_video'])
+                save_media(candidate)
+            except OSError:
+                pass
+        else:
+            shutil.rmtree(folder, ignore_errors=True)
         raise
     except Exception as exc:
-        detail = str(exc) if isinstance(exc, ValueError) else 'Media processing failed. Check ffmpeg installation and available disk space.'
-        processing = {'status': 'error', 'message': detail + (' The current media was not replaced.' if media else ' No media was added.')}
+        if proc and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        detail = str(exc) if isinstance(exc, ValueError) else 'Media preparation failed. Check ffmpeg and available disk space.'
+        processing = {'status': 'error', 'message': detail +
+                      (' Only the prepared portion is available; upload again.' if published else
+                       ' The current media was not replaced.' if media else ' No media was added.'),
+                      'percent': processing.get('percent', 0), 'playable': published, 'media_id': ident}
+        if published:
+            candidate['preparing'] = False
+            candidate['complete'] = False
+            reset_playback('Background preparation stopped. Only the prepared portion is available.')
+            try:
+                finish_partial(folder, candidate['has_video'])
+                save_media(candidate)
+            except OSError:
+                processing['message'] += ' Progress could not be saved; check storage permissions and space.'
     finally:
+        if reader and not reader.done():
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+        preparing_id = None
         upload_busy = False
         try:
             source.unlink(missing_ok=True)
@@ -180,12 +269,29 @@ async def lifespan(app):
     if manifest.exists():
         try:
             candidate = json.loads(manifest.read_text())
-            if (DATA / candidate['id'] / 'audio.m4a').exists():
+            restored = DATA / candidate['id']
+            if candidate.get('format') == 'hls' and (restored / 'master.m3u8').exists():
+                candidate['available_duration'] = min(candidate['duration'], available_seconds(restored, candidate['has_video']))
+                candidate['preparing'] = False
+                media = candidate
+                if not candidate.get('complete'):
+                    try:
+                        finish_partial(restored, candidate['has_video'])
+                    except OSError:
+                        pass
+                    processing = {'status': 'error', 'message': 'Preparation was interrupted. The prepared portion is available; upload again for the whole movie.'}
+                else:
+                    processing = {'status': 'ready', 'message': 'Movie restored. Playback starts paused.', 'percent': 100}
+            elif (restored / 'audio.m4a').exists():
                 media = candidate
                 processing = {'status': 'ready', 'message': 'Movie restored. Playback starts paused.'}
         except (ValueError, KeyError):
             pass
     yield
+    if globals().get('admin_manager'):
+        for ident, runtime in list(admin_manager.runtimes.items()):
+            if ident != 'default':
+                await runtime.room_lifespan.__aexit__(None, None, None)
     if job and not job.done():
         job.cancel()
         await asyncio.gather(job, return_exceptions=True)
@@ -196,7 +302,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.middleware('http')
 async def protections(request, call_next):
-    if request.method in ('POST', 'PUT', 'DELETE') and not same_origin(request.headers):
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and not same_origin(request.headers):
         from fastapi.responses import JSONResponse
         return JSONResponse({'detail': 'Same-origin request required.'}, status_code=403)
     response = await call_next(request)
@@ -242,13 +348,14 @@ async def join(request: Request):
     if not code.isascii() or not pin.isascii():
         recent.append(now)
         raise HTTPException(401, 'Incorrect room code or PIN.')
-    role = 'host' if hmac.compare_digest(pin, HOST_PIN) else 'viewer' if hmac.compare_digest(pin, VIEWER_PIN) else None
-    if not hmac.compare_digest(code, ROOM_CODE) or not role:
+    user = await account_login(code, pin) if globals().get('account_login') else None
+    if not user:
         recent.append(now)
         raise HTTPException(401, 'Incorrect room code or PIN.')
+    role = user['role']
     from fastapi.responses import JSONResponse
     response = JSONResponse({'role': role})
-    response.set_cookie('session', token_for(role), httponly=True, secure=SECURE, samesite='strict', max_age=TTL)
+    response.set_cookie('session', token_for(role, f".{user['id']}.{user['version']}"), httponly=True, secure=SECURE, samesite='strict', max_age=TTL)
     return response
 
 
@@ -276,17 +383,21 @@ async def me(request: Request):
 
 @app.post('/api/upload')
 async def upload(request: Request):
-    global upload_busy, job, processing
     auth(request, host=True)
-    if upload_busy:
-        raise HTTPException(409, 'Another upload is being prepared.')
+    return await receive_upload(request)
+
+
+async def receive_upload(request):
+    global upload_busy, job, processing
+    if upload_busy or deleting:
+        raise HTTPException(409, 'Another upload is being prepared or deleted.')
     if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
         raise HTTPException(503, 'Install ffmpeg and ffprobe, or run the Docker image.')
     upload_busy = True
     ident = secrets.token_hex(12)
     source = DATA / f'{ident}.upload'
     try:
-        processing = {'status': 'uploading', 'message': 'Receiving the upload. Current media will be replaced only after successful preparation.'}
+        processing = {'status': 'uploading', 'message': 'Receiving the upload. Current media stays until the first playable segments are ready.', 'media_id': ident}
         await broadcast()
         size = 0
         with source.open('wb') as target:
@@ -298,7 +409,7 @@ async def upload(request: Request):
         if not size:
             raise HTTPException(400, 'The file is empty.')
         name = request.query_params.get('name', 'Movie')
-        processing = {'status': 'processing', 'message': 'Upload complete. Preparing media…'}
+        processing = {'status': 'processing', 'message': 'Upload complete. Preparing the first playable segments…', 'media_id': ident}
         job = asyncio.create_task(process(source, ident, name))
         return {'ok': True}
     except BaseException as exc:
@@ -308,19 +419,29 @@ async def upload(request: Request):
         except OSError:
             pass
         detail = str(exc.detail) if isinstance(exc, HTTPException) else 'Upload interrupted. Please try again.'
-        processing = {'status': 'error', 'message': detail + (' Current media is unchanged.' if media else '')}
+        processing = {'status': 'error', 'message': detail + (' Current media is unchanged.' if media else ''), 'media_id': ident}
         await broadcast()
         raise
 
 
 @app.delete('/api/media')
 async def delete_media(request: Request):
-    global media, processing, upload_busy
     auth(request, host=True)
-    if upload_busy:
+    return await clear_media()
+
+
+async def clear_media():
+    global media, processing, upload_busy, deleting
+    if deleting:
+        raise HTTPException(409, 'Media is already being deleted.')
+    if upload_busy and not (media and media['id'] == preparing_id and job and not job.done()):
         raise HTTPException(409, 'Wait for the current upload or preparation to finish before deleting media.')
+    deleting = True
     upload_busy = True
     try:
+        if job and not job.done() and media and media['id'] == preparing_id:
+            job.cancel()
+            await asyncio.gather(job, return_exceptions=True)
         old = media
         # Remove the restart manifest before clearing the room. A failed unlink
         # must not make a supposedly deleted movie return after a restart.
@@ -345,6 +466,7 @@ async def delete_media(request: Request):
         return {'ok': True, **snapshot()}
     finally:
         upload_busy = False
+        deleting = False
         await broadcast()
 
 
@@ -352,6 +474,41 @@ async def delete_media(request: Request):
 async def service_worker():
     return FileResponse(BASE / 'static/sw.js', media_type='text/javascript',
                         headers={'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/'})
+
+
+def hls_path(ident, asset):
+    if not media or media['id'] != ident or media.get('format') != 'hls':
+        raise HTTPException(404)
+    import re
+    allowed = asset in ('master.m3u8', 'video.m3u8', 'audio.m3u8') or re.fullmatch(r'(audio|video)/(index\.m3u8|init\.mp4|segment_\d{6,}\.m4s)', asset)
+    if not allowed:
+        raise HTTPException(404)
+    path = DATA / ident / asset
+    if not path.is_file():
+        raise HTTPException(404)
+    return path
+
+
+@app.get('/api/hls/{ident}/{asset:path}')
+async def hls_details(ident: str, asset: str, request: Request):
+    auth(request)
+    path = hls_path(ident, asset)
+    if asset.endswith('.m3u8'):
+        raise HTTPException(404)
+    return {'size': path.stat().st_size, 'type': 'audio/mp4' if asset.startswith('audio/') else 'video/mp4'}
+
+
+@app.get('/hls/{ident}/{asset:path}')
+async def hls_asset(ident: str, asset: str, request: Request):
+    auth(request)
+    path = hls_path(ident, asset)
+    if asset.endswith('.m3u8'):
+        text = path.read_text()
+        if '#EXT-X-START' not in text:
+            text = text.replace('#EXTM3U', '#EXTM3U\n#EXT-X-START:TIME-OFFSET=0,PRECISE=YES', 1)
+        return Response(text, media_type='application/vnd.apple.mpegurl', headers={'Cache-Control': 'no-store'})
+    return FileResponse(path, media_type='audio/mp4' if asset.startswith('audio/') else 'video/mp4',
+                        headers={'Cache-Control': 'private, no-cache'})
 
 
 @app.get('/api/media/{ident}/{track}')
@@ -385,16 +542,20 @@ def control(body):
         raise ValueError('Unknown playback command.')
     now = time.time()
     pos = position(now)
+    if action in ('pause', 'sync'):
+        pos = min(pos, media.get('available_duration', media['duration']))
     if action == 'seek':
         pos = float(body.get('position', 0))
         if not math.isfinite(pos):
             raise ValueError('Invalid seek position.')
         pos = max(0.0, min(media['duration'], pos))
+        if pos > media.get('available_duration', media['duration']):
+            raise ValueError('That position is not prepared yet. Seek within the available portion.')
     if action == 'skip':
         seconds = float(body.get('seconds', 0))
         if seconds not in (-10, 10):
             raise ValueError('Skip must be 10 seconds backward or forward.')
-        pos = max(0.0, min(media['duration'], pos + seconds))
+        pos = max(0.0, min(media.get('available_duration', media['duration']), pos + seconds))
     elif action == 'restart':
         pos = 0.0
     playing = state['playing'] if action in ('seek', 'sync', 'skip', 'restart') else action == 'play'
@@ -436,6 +597,7 @@ async def websocket(ws: WebSocket):
                     'ready': body.get('ready') is True,
                     'mode': body.get('mode') if body.get('mode') in ('audio', 'video', 'combined') else 'audio',
                     'downloaded': body.get('downloaded') is True,
+                    'drift': body.get('drift') if isinstance(body.get('drift'), (float, int)) and math.isfinite(body['drift']) else None,
                 }
             elif body.get('type') == 'control':
                 action = body.get('action')
@@ -469,3 +631,8 @@ async def websocket(ws: WebSocket):
 
 
 app.mount('/static', StaticFiles(directory=BASE / 'static'), name='static')
+
+if not globals().get('IS_ROOM_RUNTIME'):
+    import sys
+    from admin_portal.backend import install
+    admin_manager = install(sys.modules[__name__])

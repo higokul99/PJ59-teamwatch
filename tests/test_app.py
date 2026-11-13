@@ -29,6 +29,8 @@ class RoomTests(unittest.TestCase):
         app.peers.clear()
         app.peer_status.clear()
         app.upload_busy = False
+        app.deleting = False
+        app.preparing_id = None
         app.processing = {'status': 'idle', 'message': 'Ready'}
         (app.DATA / 'current.json').unlink(missing_ok=True)
         app.state.update(playing=False, position=0, anchor=100, revision=0)
@@ -316,8 +318,11 @@ class RoomTests(unittest.TestCase):
         info = {'format': {'duration': '90'}, 'streams': [{'codec_type': 'audio'}]}
         async def fake_process(*args, **kwargs):
             if args[0] == 'ffmpeg':
-                Path(args[-1]).write_bytes(b'prepared audio')
-            return SimpleNamespace(returncode=0, wait=AsyncMock(return_value=0),
+                target = Path(args[-1])
+                (target.parent / 'init.mp4').write_bytes(b'init')
+                (target.parent / 'segment_000000.m4s').write_bytes(b'prepared audio')
+                target.write_text('#EXTM3U\n#EXTINF:90,\nsegment_000000.m4s\n#EXT-X-ENDLIST\n')
+            return SimpleNamespace(returncode=0, stdout=SimpleNamespace(readline=AsyncMock(return_value=b'')), wait=AsyncMock(return_value=0),
                                    communicate=AsyncMock(return_value=(json.dumps(info).encode(), b'')))
         with patch.object(app.asyncio, 'create_subprocess_exec', side_effect=fake_process), patch.object(app, 'broadcast', new_callable=AsyncMock):
             asyncio.run(app.process(source, ident, 'Replacement song'))
@@ -364,6 +369,67 @@ class RoomTests(unittest.TestCase):
         self.assertEqual(response.json()['processing']['status'], 'error')
         self.assertFalse(app.upload_busy)
 
+    def test_segment_paths_are_authenticated_and_never_expose_temporary_files(self):
+        self.fake_media()
+        app.media.update(format='hls', complete=False, available_duration=8)
+        folder = app.DATA / 'testmedia'
+        (folder / 'video').mkdir(exist_ok=True)
+        (folder / 'video/index.m3u8').write_text('#EXTM3U\n#EXTINF:4,\nsegment_000000.m4s\n')
+        (folder / 'video/init.mp4').write_bytes(b'init')
+        (folder / 'video/segment_000000.m4s').write_bytes(b'123456')
+        self.assertEqual(self.client.get('/hls/testmedia/video/index.m3u8').status_code, 401)
+        self.join()
+        response = self.client.get('/hls/testmedia/video/index.m3u8')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('TIME-OFFSET=0', response.text)
+        self.assertEqual(response.headers['cache-control'], 'no-store')
+        self.assertEqual(self.client.get('/hls/testmedia/video/segment_000000.m4s', headers={'Range': 'bytes=1-2'}).content, b'23')
+        self.assertEqual(self.client.get('/hls/testmedia/video/segment_000000.m4s.tmp').status_code, 404)
+        self.assertEqual(self.client.get('/hls/testmedia/conversion.log').status_code, 404)
+        with self.assertRaises(ValueError):
+            app.control({'action': 'seek', 'position': 90})
+        app.control({'action': 'skip', 'seconds': 10})
+        self.assertEqual(app.state['position'], 8)
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe unavailable')
+    def test_playable_segments_are_published_before_background_preparation_finishes(self):
+        fixture = app.DATA / 'early-start.mkv'
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=size=160x90:rate=12',
+                        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '20',
+                        '-c:v', 'libx264', '-g', '24', '-pix_fmt', 'yuv420p', '-c:a', 'aac', str(fixture)], check=True)
+        real_exec = app.asyncio.create_subprocess_exec
+        async def paced_encoder(*args, **kwargs):
+            if args[0] == 'ffmpeg':
+                items = list(args)
+                index = items.index('-i')
+                items[index:index] = ['-readrate', '4']
+                args = items
+            return await real_exec(*args, **kwargs)
+        with self.client, patch.object(app.asyncio, 'create_subprocess_exec', side_effect=paced_encoder):
+            self.join('9292')
+            started = time.monotonic()
+            self.assertEqual(self.client.post('/api/upload', params={'name': 'Early start'}, content=fixture.read_bytes(), headers=ORIGIN).status_code, 200)
+            for _ in range(200):
+                data = self.client.get('/api/me').json()
+                if data['processing'].get('playable'):
+                    break
+                time.sleep(.025)
+            self.assertTrue(data['processing'].get('playable'), data['processing'])
+            self.assertFalse(data['media']['complete'])
+            self.assertGreater(data['processing']['percent'], 0)
+            self.assertLess(data['processing']['percent'], 100)
+            startup = time.monotonic() - started
+            self.assertLess(startup, 120)
+            print(f'First playable segments available in {startup:.2f}s while preparation is still running.')
+            ident = data['media']['id']
+            self.assertEqual(self.client.get(f'/hls/{ident}/master.m3u8').status_code, 200)
+            self.assertFalse(app.job.done())
+            # Deleting an already playable movie cancels its background encoder.
+            self.assertEqual(self.client.delete('/api/media', headers=ORIGIN).status_code, 200)
+            self.assertIsNone(app.media)
+            self.assertFalse((app.DATA / ident).exists())
+            self.assertFalse(app.deleting)
+
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe unavailable')
     def test_real_upload_replace_and_delete_through_api(self):
         fixture = app.DATA / 'api-fixture.mkv'
@@ -396,6 +462,40 @@ class RoomTests(unittest.TestCase):
             self.assertFalse((app.DATA / 'current.json').exists())
 
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe unavailable')
+    def test_background_completion_does_not_reset_playback(self):
+        fixture = app.DATA / 'continue-playback.mkv'
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=size=160x90:rate=12',
+                        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '16',
+                        '-c:v', 'libx264', '-g', '24', '-pix_fmt', 'yuv420p', '-c:a', 'aac', str(fixture)], check=True)
+        real_exec = app.asyncio.create_subprocess_exec
+        async def paced_encoder(*args, **kwargs):
+            if args[0] == 'ffmpeg':
+                args = list(args)
+                index = args.index('-i')
+                args[index:index] = ['-readrate', '4']
+            return await real_exec(*args, **kwargs)
+        with self.client, patch.object(app.asyncio, 'create_subprocess_exec', side_effect=paced_encoder):
+            self.join('9292')
+            self.client.post('/api/upload', params={'name': 'Keep playing'}, content=fixture.read_bytes(), headers=ORIGIN)
+            for _ in range(240):
+                data = self.client.get('/api/me').json()
+                if data['processing'].get('playable'):
+                    break
+                time.sleep(.025)
+            self.assertFalse(data['media']['complete'])
+            app.control({'action': 'play'})
+            revision, anchor = app.state['revision'], app.state['anchor']
+            for _ in range(240):
+                data = self.client.get('/api/me').json()
+                if data['media']['complete']:
+                    break
+                time.sleep(.025)
+            self.assertTrue(data['media']['complete'])
+            self.assertTrue(app.state['playing'])
+            self.assertEqual(app.state['revision'], revision)
+            self.assertEqual(app.state['anchor'], anchor)
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe unavailable')
     def test_actual_movie_and_audio_conversion(self):
         for video in (True, False):
             ident = 'realvideo' if video else 'realaudio'
@@ -411,10 +511,16 @@ class RoomTests(unittest.TestCase):
             asyncio.run(app.process(source, ident, 'Fixture'))
             self.assertEqual(app.processing['status'], 'ready', app.processing)
             self.assertEqual(app.media['has_video'], video)
-            for track in (['audio.m4a', 'video.mp4', 'combined.mp4'] if video else ['audio.m4a']):
+            self.assertEqual(app.media['format'], 'hls')
+            self.assertTrue(app.media['complete'])
+            self.assertEqual(app.processing['percent'], 100)
+            tracks = ['audio/index.m3u8', 'video/index.m3u8', 'master.m3u8'] if video else ['audio/index.m3u8']
+            for track in tracks:
                 info = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-show_streams', '-of', 'json', str(app.DATA / ident / track)]))
-                types = [s['codec_type'] for s in info['streams']]
-                self.assertEqual(types, {'audio.m4a':['audio'], 'video.mp4':['video'], 'combined.mp4':['video', 'audio']}[track])
+                types = {stream['codec_type'] for stream in info['streams']}
+                expected = {'audio'} if track.startswith('audio') else {'video'} if track.startswith('video') else {'audio', 'video'}
+                self.assertEqual(types, expected)
+
 
 
 if __name__ == '__main__':

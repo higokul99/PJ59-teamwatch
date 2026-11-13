@@ -35,5 +35,5 @@ trap cleanup EXIT
 ssh -M -S "$SOCKET" -o ControlPersist=600 -fN "$VPS"
 REMOTE_DIR=$(ssh -S "$SOCKET" "$VPS" 'mktemp -d /tmp/teamwatch-deploy.XXXXXXXX')
 [[ "$REMOTE_DIR" =~ ^/tmp/teamwatch-deploy\.[A-Za-z0-9]+$ ]] || { echo 'Unexpected remote temporary directory.'; exit 1; }
-scp -o "ControlPath=$SOCKET" deploy/remote.sh "$VPS:$REMOTE_DIR/remote.sh"
+scp -o "ControlPath=$SOCKET" docs/deployment/remote.sh "$VPS:$REMOTE_DIR/remote.sh"
 ssh -t -S "$SOCKET" "$VPS" "bash '$REMOTE_DIR/remote.sh' '$ACTION' '$SHA'"

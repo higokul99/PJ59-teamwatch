@@ -32,8 +32,7 @@ Do not prune release images you may need for rollback. Release records live in
 `/srv/apps/teamwatch/{test,prod}/.deploy`, outside Git. A first deployment has no
 previous release to restore and stops its service if activation fails.
 
-The script configures Nginx only on first setup and checks the existing site on
-later releases. Changes to domain, port, `.env`, Nginx settings, and media contents
+The script creates Nginx configuration on first setup. For existing managed sites, it upgrades the known viewer-only WebSocket location to cover `/api/admin/ws` as well, backing up the configuration under `.deploy` before changing it. Other TLS/Certbot settings are preserved; failed deployment attempts restore the saved configuration. Changes to domain, port, `.env`, Nginx settings, and media contents
 are not rolled back with application code. Do not run deployments during uploads
 or conversion. Playback restarts paused after a container restart.
 
@@ -43,7 +42,7 @@ Use dedicated directories and domains; do not reuse Metohub's site configuration
 - `/srv/apps/teamwatch/test/teamwatch-code`
 - `/srv/apps/teamwatch/prod/teamwatch-code`
 
-Each directory is an independent clone of the same Git repository. Deploy an exact tested commit in both. `COMPOSE_PROJECT_NAME=teamwatch-test` and `teamwatch-prod` isolate Docker volumes and networks despite identical directory basenames. Keep those names stable across releases. TeamWatch has no database; its persistent data is the uploaded/prepared media volume.
+Each directory is an independent clone of the same Git repository. Deploy an exact tested commit in both. `COMPOSE_PROJECT_NAME=teamwatch-test` and `teamwatch-prod` isolate Docker volumes and networks despite identical directory basenames. Keep those names stable across releases. The media volume now also contains `admin.sqlite3` (rooms, account hashes, admin password and audit history), its SQLite WAL files, and media for every room. Back up the complete volume.
 
 ## Before installation
 
@@ -52,9 +51,9 @@ Verify existing Nginx sites, port assignments (`ss -ltnp`), DNS, disk, RAM, and 
 In each clone, create a fresh configuration, substituting the verified unused port:
 
 ```sh
-python3 deploy/init_env.py test --port 8890
+python3 docs/deployment/init_env.py test --port 8890
 # For the production clone instead:
-# python3 deploy/init_env.py prod --port 8891
+# python3 docs/deployment/init_env.py prod --port 8891
 ```
 
 The commands refuse to overwrite existing `.env` files. They generate independent session secrets and set HTTPS cookies. Ports above are proposals only. Review PINs locally in `.env`, without pasting secrets into logs. Do not copy test secrets to production.
@@ -97,4 +96,16 @@ Before a risky change, finish any conversion and stop the app during a maintenan
 
 For a code rollback, check out the prior recorded commit and rebuild with the same Compose project name and `.env`. The named media volume is retained. Restore media only if needed, into the correct environment, while the application is stopped; container user 10001 must retain read/write access. Never use `docker compose down -v`, volume pruning, or manual edits under `/var/lib/docker` as a release step.
 
-The first version retains one active movie, deleting the previous prepared movie after successful replacement. Back up anything you need to retain before replacing it. Allow several times the movie's size in free space for transcoding and backup.
+Each room retains one active movie, deleting its previous prepared movie after successful replacement. Back up anything you need to retain before replacing it. Allow several times the movie's size in free space for transcoding and backup.
+
+## Admin portal upgrade and rollback compatibility
+
+This release creates `admin.sqlite3` in the existing media volume and imports the original room/passcodes once. Initialize the dedicated administrator **in each environment separately** after deployment:
+
+```sh
+docker compose --project-name teamwatch-prod exec teamwatch python -m admin_portal set-password
+```
+
+Run from the production checkout (use `teamwatch-test` in staging). Password entry is interactive and is not stored in shell history. Sign in at `/admin` as `hellometora@gmail.com`. Until initialized, the admin login is unavailable; viewer login continues working. New/changed room accounts are persisted in SQLite, not `.env`.
+
+Back up the **whole stopped volume**, including SQLite database/WAL files and `rooms/`, plus the production `.env`, before upgrading. Do not rely on copying only `current.json`. Keep the previous release image. Rolling back to the older single-room version preserves files but makes new rooms/admin accounts unavailable; it also resumes use of the old environment PINs. Code rollback does not undo admin actions or media deletion. Do not roll back during an upload or background conversion. Validate a restored backup in staging before any production data restoration.

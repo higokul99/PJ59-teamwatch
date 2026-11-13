@@ -40,6 +40,7 @@
   if(!await ready()){emit({status:'fallback',message:'Download storage unavailable. Using streaming.'});return;}
   if(current!==generation)return;
   try{
+   if(path.startsWith('/hls/')){await hlsDownload(path,current,emit);return;}
    const response=await fetch('/api'+path,{cache:'no-store'});
    if(!response.ok)throw Error('Could not read media details');
    const metadata=await response.json();
@@ -57,6 +58,51 @@
     await new Promise(resolve=>setTimeout(resolve,60));
    }
   }catch(error){emit({status:'error',message:`Download paused: ${error.message}. Playback can still stream. Retry download when connected.`});}
+ }
+ async function playlistTree(path,seen=new Set()){
+  if(seen.has(path))return {groups:[],complete:true};
+  seen.add(path);
+  const response=await fetch(path,{cache:'no-store'});
+  if(!response.ok)throw Error('Prepared segments could not be read');
+  const text=await response.text(),files=[],children=[];
+  function resolve(value){
+   const url=new URL(value,new URL(path,location.origin));
+   if(url.origin!==location.origin||!url.pathname.startsWith('/hls/'))throw Error('Invalid playlist resource');
+   return url.pathname;
+  }
+  for(const raw of text.split('\n')){
+   const line=raw.trim();if(!line)continue;
+   if(line.startsWith('#EXT-X-MAP:')){const match=/URI="([^"]+)"/.exec(line);if(match)files.push(resolve(match[1]));}
+   else if(line.startsWith('#EXT-X-MEDIA:')){const match=/URI="([^"]+)"/.exec(line);if(match)children.push(resolve(match[1]));}
+   else if(!line.startsWith('#')){const resource=resolve(line);resource.endsWith('.m3u8')?children.push(resource):files.push(resource);}
+  }
+  if(children.length){
+   const nested=await Promise.all(children.map(child=>playlistTree(child,seen)));
+   return {groups:nested.flatMap(item=>item.groups),complete:nested.every(item=>item.complete)};
+  }
+  return {groups:[files],complete:text.includes('#EXT-X-ENDLIST')};
+ }
+ async function hlsDownload(path,current,emit){
+  await request({type:'prune',id:path.split('/')[2]});
+  const saved=new Set();let bytes=0;
+  while(current===generation){
+   const tree=await playlistTree(path),ordered=[];
+   const count=Math.max(0,...tree.groups.map(group=>group.length));
+   // Interleave audio/video segments so both tracks download from the beginning.
+   for(let index=0;index<count;index++)for(const group of tree.groups)if(group[index])ordered.push(group[index]);
+   for(const resource of ordered){
+    if(current!==generation)return;
+    if(saved.has(resource))continue;
+    const result=await request({type:'file',path:resource});
+    if(!result.saved){emit({status:'fallback',message:'Device storage is busy or unavailable. Playback will stream.'});return;}
+    saved.add(resource);bytes+=result.bytes;
+    emit({status:'downloading',bytes,segments:saved.size,totalSegments:ordered.length,hls:true});
+    await new Promise(resolve=>setTimeout(resolve,60));
+   }
+   if(tree.complete){emit({status:'complete',bytes,segments:saved.size,hls:true});return;}
+   emit({status:'waiting',bytes,segments:saved.size,hls:true,message:'Available segments saved. Download continues as more are prepared.'});
+   await new Promise(resolve=>setTimeout(resolve,1500));
+  }
  }
  async function clear(){stop();if(available)try{await request({type:'clear'});}catch{}}
  root.TeamWatchDownload={ready,start,stop,clear};

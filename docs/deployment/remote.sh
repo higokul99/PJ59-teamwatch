@@ -52,7 +52,7 @@ with socket.socket() as probe:
     try: probe.bind(('127.0.0.1', int(sys.argv[1])))
     except OSError: raise SystemExit('Proposed port is already occupied; stop and choose another.')
 PY
-    python3 deploy/init_env.py "$ENVIRONMENT" --port "$PORT"
+    python3 docs/deployment/init_env.py "$ENVIRONMENT" --port "$PORT"
 fi
 chmod 600 .env
 # Verify stable project/port/volume identity without printing secrets.
@@ -75,10 +75,14 @@ write_override() {
 }
 dc() { docker compose --project-name "teamwatch-$ENVIRONMENT" -f "$CODE/compose.yaml" -f "$STATE/image.yaml" "$@"; }
 NEW_SITE=0
+NGINX_BACKUP=''
 recover() {
     result=$?
     trap - ERR
     echo 'Deployment failed. Attempting to restore the prior application release.'
+    if [[ -n "$NGINX_BACKUP" ]]; then
+        cp "$NGINX_BACKUP" "$SITE" && nginx -t && systemctl reload nginx || echo 'Nginx restoration failed; inspect the saved configuration.'
+    fi
     if [[ -n "$OLD" ]]; then
         git checkout --detach "$OLD" && write_override "$OLD" && dc up -d --no-build --pull never --wait --wait-timeout 120 || echo 'Automatic restoration failed; inspect docker compose logs.'
     else
@@ -100,7 +104,7 @@ if [[ ! -e "$SITE" ]]; then
     python3 - "$DOMAIN" "$PORT" "$SITE" <<'PY'
 from pathlib import Path
 import sys
-content = Path('deploy/nginx.conf.template').read_text().replace('__DOMAIN__', sys.argv[1]).replace('__PORT__', sys.argv[2])
+content = Path('docs/deployment/nginx.conf.template').read_text().replace('__DOMAIN__', sys.argv[1]).replace('__PORT__', sys.argv[2])
 with open(sys.argv[3], 'x') as target:
     target.write('# Managed by TeamWatch deployment\n' + content)
 PY
@@ -108,6 +112,21 @@ fi
 # Never adopt a site belonging to another project.
 rg_marker='# Managed by TeamWatch deployment'
 grep -qF "$rg_marker" "$SITE"
+# Upgrade only the known, managed WebSocket location; preserve Certbot/TLS settings.
+if grep -qF 'location = /ws {' "$SITE"; then
+    NGINX_BACKUP="$STATE/nginx-before-$SHA-$(date +%s).conf"
+    cp "$SITE" "$NGINX_BACKUP"
+    python3 - "$SITE" <<'PYNGINX'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+content = path.read_text()
+old = 'location = /ws {'
+if content.count(old) != 1:
+    raise SystemExit('Unexpected Nginx layout; inspect WebSocket locations before deploying.')
+path.write_text(content.replace(old, 'location ~ ^/(ws|api/admin/ws)$ {'))
+PYNGINX
+fi
 if [[ -L "$LINK" ]]; then
     [[ $(readlink "$LINK") == "$SITE" ]] || { echo 'Unexpected Nginx link.'; false; }
 else
@@ -122,6 +141,12 @@ if ! curl --fail --silent --show-error --max-time 15 "https://$DOMAIN/health" >/
     certbot --nginx -d "$DOMAIN" --redirect
 fi
 curl --fail --silent --show-error --max-time 20 "https://$DOMAIN/health" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] and d["ffmpeg"]'
+if [[ "$ACTION" != rollback ]]; then
+    curl --fail --silent --show-error --max-time 20 "https://$DOMAIN/admin" >/dev/null
+    curl --fail --silent --show-error --max-time 20 "https://$DOMAIN/static/admin/app.js" >/dev/null
+    admin_status=$(curl --silent --show-error --max-time 20 -o /dev/null -w '%{http_code}' "https://$DOMAIN/api/admin/metrics")
+    [[ "$admin_status" == 401 ]] || { echo "Admin authentication check failed: HTTP $admin_status"; false; }
+fi
 # Record only completed releases; keep the prior image available locally.
 if [[ -n "$OLD" && "$OLD" != "$SHA" ]]; then printf '%s\n' "$OLD" > "$STATE/previous"; fi
 printf '%s\n' "$SHA" > "$STATE/current"

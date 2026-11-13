@@ -215,3 +215,58 @@ test('clearing media stops both tracks and resets empty room state',()=>{
  assert.equal(h.node('time').textContent,'00:00 / 00:00');
  assert.equal(h.node('screenTitle').textContent,'The room is ready.');
 });
+
+test('preparation progress exposes playable prefix without resetting the same movie',()=>{
+ const h=browserHarness();
+ const data={server_time:100,count:1,participants:[],timeline:{position:0,playing:false,anchor:100,revision:8},media:{id:'hls-fixture',duration:200,name:'Movie',has_video:true,format:'hls',available_duration:8,complete:false},processing:{status:'processing',percent:4,prepared_seconds:8,total_seconds:200,playable:true,message:'Ready to play'}};
+ h.context.testSnapshot=data;h.run('receiveState(testSnapshot);');
+ assert.equal(h.node('preparePanel').hidden,false);assert.equal(h.node('prepareProgress').value,4);
+ assert.ok(h.node('prepareHeading').textContent.includes('Ready to play'));
+ assert.equal(h.node('seek').max,8);
+ assert.equal(h.node('video').src,'/hls/hls-fixture/master.m3u8');
+ h.run('enabled=true;testSnapshot.media.available_duration=16;testSnapshot.processing.percent=8;receiveState(testSnapshot);');
+ assert.equal(h.run('enabled'),true);assert.equal(h.node('seek').max,16);
+ h.node('jumpTime').value='00:30';h.node('jumpForm').onsubmit({preventDefault(){}});
+ assert.ok(h.node('jumpError').textContent.includes('prepared so far'));
+});
+
+test('uploading a replacement does not show the old movie as 100 percent prepared',()=>{
+ const h=browserHarness();h.run('media={id:"old",duration:200,format:"hls",complete:true,available_duration:200};renderPreparation({status:"uploading",media_id:"new",message:"Receiving upload"});');
+ assert.equal(h.node('preparePercent').textContent,'Working…');
+ assert.ok(!h.node('prepareDetail').textContent.includes('200'));
+ assert.ok(!h.node('prepareHint').textContent.includes('entire movie'));
+});
+
+test('host sees prepared duration, remaining movie and warning near the preparation edge',()=>{
+ const h=browserHarness();
+ h.run('role="host";media={id:"movie",duration:9000,available_duration:1800,complete:false,format:"hls"};roomState={position:1700,playing:false,anchor:100};renderPreparation({status:"processing",media_id:"movie",prepared_seconds:1800,total_seconds:9000,percent:20,playable:true,message:"Preparing"});');
+ assert.equal(h.node('hostPreparation').hidden,false);
+ assert.equal(h.node('preparedThrough').textContent,'00:30:00 / 02:30:00');
+ assert.equal(h.node('preparationRemaining').textContent,'02:00:00');
+ assert.equal(h.node('preparedAhead').textContent,'00:01:40');
+ assert.ok(h.node('preparationAdvice').textContent.includes('playback may pause'));
+ h.run('roomState.position=1790;sync();');
+ assert.equal(h.node('preparedAhead').textContent,'00:00:10');
+ assert.ok(h.node('preparationAdvice').textContent.includes('within 30 seconds'));
+});
+
+test('host sees full readiness after completion and restored partial media stays visible',()=>{
+ const h=browserHarness();
+ h.run('role="host";media={id:"movie",duration:9000,available_duration:9000,complete:true,format:"hls"};renderPreparation({status:"ready",message:"Restored"});');
+ assert.equal(h.node('preparationRemaining').textContent,'00:00:00');
+ assert.ok(h.node('preparationAdvice').textContent.startsWith('Fully prepared'));
+ h.run('media.complete=false;media.available_duration=1200;renderPreparation({status:"error",message:"Interrupted"});');
+ assert.equal(h.node('preparePanel').hidden,false);
+ assert.ok(h.node('preparationAdvice').textContent.includes('stopped at 00:20:00'));
+ assert.ok(h.node('prepareHint').textContent.includes('upload again'));
+});
+
+test('new upload does not inherit full readiness from the previous movie',()=>{
+ const h=browserHarness();
+ h.run('role="host";media={id:"old",duration:200,complete:true,available_duration:200,format:"hls"};renderPreparation({status:"processing",media_id:"new",prepared_seconds:4,total_seconds:9000,percent:0.04,message:"Preparing"});');
+ assert.equal(h.node('preparedThrough').textContent,'00:00:04 / 02:30:00');
+ assert.equal(h.node('preparedAhead').textContent,'Next movie');
+ assert.ok(!h.node('preparationAdvice').textContent.startsWith('Fully prepared'));
+ h.run('role="viewer";renderHostPreparation();');
+ assert.equal(h.node('hostPreparation').hidden,true);
+});

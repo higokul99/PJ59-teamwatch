@@ -38,7 +38,7 @@ async function prune(mediaId){
   const request=transaction.objectStore('chunks').openCursor();
   request.onsuccess=()=>{
    const cursor=request.result;if(!cursor)return;
-   if(!mediaId||!String(cursor.key).startsWith(`/media/${mediaId}/`))cursor.delete();
+   if(!mediaId||(!String(cursor.key).startsWith(`/media/${mediaId}/`)&&!String(cursor.key).startsWith(`/hls/${mediaId}/`)))cursor.delete();
    cursor.continue();
   };
   transaction.oncomplete=()=>resolve();transaction.onabort=transaction.onerror=()=>reject(transaction.error);
@@ -46,7 +46,9 @@ async function prune(mediaId){
 }
 function mediaPath(raw){
  const url=new URL(raw,self.location.origin);
- if(url.origin!==self.location.origin||!/^\/media\/[a-f0-9]{24}\/(audio\.m4a|video\.mp4|combined\.mp4)$/.test(url.pathname))throw Error('Invalid media path');
+ const legacy=/^\/media\/[a-f0-9]{24}\/(audio\.m4a|video\.mp4|combined\.mp4)$/.test(url.pathname);
+ const hls=/^\/hls\/[a-f0-9]{24}\/(audio|video)\/(init\.mp4|segment_\d{6,}\.m4s)$/.test(url.pathname);
+ if(url.origin!==self.location.origin||(!legacy&&!hls))throw Error('Invalid media path');
  return url.pathname;
 }
 async function info(path){
@@ -132,6 +134,14 @@ self.addEventListener('message',event=>{
    if(data.type==='prune'){
     if(!/^[a-f0-9]{24}$/.test(data.id))throw Error('Invalid media');
     await prune(data.id);port.postMessage({ok:true});return;
+   }
+   if(data.type==='file'){
+    const path=mediaPath(data.path),metadata=await info(path);
+    for(let index=0;index<Math.ceil(metadata.size/CHUNK_SIZE);index++){
+     const result=await chunk(path,index,metadata.size);
+     if(!result.saved){port.postMessage({ok:true,saved:false,bytes:0});return;}
+    }
+    port.postMessage({ok:true,saved:true,bytes:metadata.size});return;
    }
    if(data.type!=='chunk')throw Error('Invalid cache command');
    const path=mediaPath(data.path),metadata=await info(path);

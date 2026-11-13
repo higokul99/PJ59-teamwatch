@@ -15,8 +15,7 @@ test('chunk bounds include the final short chunk without reading beyond EOF',()=
  assert.deepEqual(chunkBounds(1,CHUNK_SIZE+3),{start:CHUNK_SIZE,end:CHUNK_SIZE+2});
  assert.throws(()=>chunkBounds(2,CHUNK_SIZE+3));
 });
-function workerHarness(size=CHUNK_SIZE*2+53){
- const mediaPath='/media/0123456789abcdef01234567/audio.m4a';
+function workerHarness(size=CHUNK_SIZE*2+53,mediaPath='/media/0123456789abcdef01234567/audio.m4a'){
  const bytes=Uint8Array.from({length:size},(_,i)=>i%251);
  const store=new Map(),network=[];
  let authorized=true;
@@ -27,7 +26,7 @@ function workerHarness(size=CHUNK_SIZE*2+53){
   async fetch(input,options={}){
    const url=typeof input==='string'?input:input.url;
    if(!authorized)return new Response('Join first',{status:401});
-   if(url.includes('/api/media/'))return Response.json({size:bytes.length,type:'audio/mp4'});
+   if(url.includes('/api/'))return Response.json({size:bytes.length,type:'audio/mp4'});
    const header=options.headers?.Range||(typeof input!=='string'?input.headers.get('Range'):null);
    const selected=range(header,bytes.length);network.push(header);
    return new Response(bytes.slice(selected.start,selected.end+1),{status:selected.status,headers:{'Content-Range':`bytes ${selected.start}-${selected.end}/${bytes.length}`}});
@@ -99,4 +98,12 @@ test('slow storage cannot retain an unbounded number of chunk buffers',async()=>
   assert.ok(h.run('inflight.size')<=4);
  }finally{release();await new Promise(resolve=>setImmediate(resolve));}
  assert.equal(h.run('pendingWrites'),0);
+});
+
+test('immutable HLS media segments use the cache while growing playlists do not',async()=>{
+ const h=workerHarness(32,'/hls/0123456789abcdef01234567/audio/segment_000000.m4s');
+ const response=await h.serve();assert.deepEqual(new Uint8Array(await response.arrayBuffer()),h.bytes);
+ await(await h.serve()).arrayBuffer();assert.equal(h.network.length,1);
+ assert.throws(()=>h.run('mediaPath("/hls/0123456789abcdef01234567/audio/index.m3u8")'));
+ assert.throws(()=>h.run('mediaPath("/hls/0123456789abcdef01234567/audio/segment_000000.m4s.tmp")'));
 });

@@ -4,8 +4,9 @@ const $ = id => document.getElementById(id);
 let role, ws, roomState, media, mediaKey = '', mode = localStorage.getItem('tw-mode') || 'combined';
 let enabled = false, clockOffset = 0, clockSamples = [], reconnect, pingTimer, leaving = false, connecting = false, uploading = false;
 let startTimer, clockTimers = [], lastSeek = -Infinity, pendingForce = false, playPending = false;
-let downloadState={},stallSince=null,stallReported=-1,seekDragging=false;
+let downloadState={},stallSince=null,stallReported=-1,seekDragging=false,playbackSource='';
 let playbackEvents=[],playbackCounts={};
+let latestPreparation={};
 let adjustment = Number(localStorage.getItem('tw-offset') || 0);
 if (!Number.isFinite(adjustment)) adjustment = 0;
 adjustment = Math.max(-2000, Math.min(2000, adjustment));
@@ -90,21 +91,79 @@ function ping(){if(ws?.readyState===WebSocket.OPEN){reportStatus();ws.send(JSON.
 function reportStatus(){
  if(ws?.readyState!==WebSocket.OPEN||!media)return;
  const p=player();
- ws.send(JSON.stringify({type:'status',media_id:media.id,active:enabled,ready:enabled&&!p.seeking&&p.readyState>=3,mode,downloaded:downloadState.status==='complete'}));
+ ws.send(JSON.stringify({type:'status',media_id:media.id,active:enabled,ready:enabled&&!p.seeking&&p.readyState>=3,mode,drift:roomState?targetPosition()-p.currentTime:null,downloaded:downloadState.status==='complete'}));
 }
 function downloadTrack(){
  if(!media||!globalThis.TeamWatchDownload)return;
- const path=player().getAttribute('src');
+ const path=playbackSource||player().getAttribute('src');
  if(!path)return;
  TeamWatchDownload.start(path,state=>{
   const justFinished=state.status==='complete'&&downloadState.status!=='complete';
-  downloadState=state;
+  downloadState={...downloadState,...state};
   if(justFinished)recordPlayback('download-complete');
+  renderDownload();
+  reportStatus();
+ });
+}
+function renderDownload(){
+ const state=downloadState;
+ if(!state.status)return;
+ if(state.hls){
+  $('downloadProgress').value=state.status==='complete'&&media?.complete?100:Math.min(99,Number(media?.available_duration||0)/Number(media?.duration||1)*100);
+  $('downloadStatus').textContent=state.status==='complete'?(media?.complete?'Fully downloaded on this device. Playback uses saved segments.':'All available segments saved; the rest is not prepared yet.'):
+   `${state.message||'Downloading prepared segments.'} · ${state.segments||0} files · ${((state.bytes||0)/1048576).toFixed(1)} MB saved`;
+ }else{
   const progress=state.total?state.bytes/state.total*100:0;
   $('downloadProgress').value=progress;
   $('downloadStatus').textContent=state.status==='complete'?'Fully downloaded on this device. Playback uses the saved track.':state.status==='downloading'?`Downloading ${Math.floor(progress)}% · ${(state.bytes/1048576).toFixed(1)} / ${(state.total/1048576).toFixed(1)} MB`:state.message;
-  reportStatus();
- });
+ }
+}
+function seekLimit(){return media?Math.min(media.duration,media.available_duration??media.duration):0;}
+function renderPreparation(preparation){
+ latestPreparation=preparation;
+ renderHostPreparation();
+ const visible=typeof preparation.percent==='number'||(media?.format==='hls')||['processing','uploading'].includes(preparation.status);
+ $('preparePanel').hidden=!visible;
+ if(!visible)return;
+ const contextMedia=preparation.media_id&&preparation.media_id!==media?.id?null:media;
+ const percent=Number.isFinite(preparation.percent)?preparation.percent:(preparation.status==='ready'&&contextMedia?.complete?100:null);
+ if(percent===null){$('prepareProgress').removeAttribute('value');$('preparePercent').textContent='Working…';}
+ else{$('prepareProgress').value=percent;$('preparePercent').textContent=`${percent.toFixed(1)}%`;}
+ $('prepareHeading').textContent=preparation.status==='error'?'Preparation stopped':preparation.status==='uploading'?'Uploading movie':preparation.status==='ready'?'Movie ready':preparation.playable?'Ready to play · preparing the rest':'Preparing the first segments';
+ const prepared=preparation.prepared_seconds??contextMedia?.available_duration??0;
+ const total=preparation.total_seconds??contextMedia?.duration??0;
+ const speed=preparation.speed?` · ${preparation.speed.toFixed(1)}× preparation speed`:'';
+ $('prepareDetail').textContent=`${preparation.message}${total?` Prepared ${fmt(prepared)} of ${fmt(total)}.`:''}${speed}`;
+ $('prepareHint').textContent=preparation.status==='error'?'Preparation stopped. Only the prepared portion is available; upload again to finish.':preparation.status==='ready'&&contextMedia?.complete?'The entire movie is ready. You can seek anywhere.':preparation.playable?`Play now${preparation.startup_seconds?` · first segments ready after ${preparation.startup_seconds.toFixed(1)} seconds`:''}. Available positions extend as background preparation continues.`:'Playback becomes available after the first few complete segments, without waiting for the whole movie.';
+}
+function preparationTime(seconds){
+ const value=Math.max(0,Math.floor(Number(seconds)||0));
+ return [Math.floor(value/3600),Math.floor(value/60)%60,value%60].map(n=>String(n).padStart(2,'0')).join(':');
+}
+function renderHostPreparation(){
+ const preparation=latestPreparation;
+ const current=preparation.media_id&&preparation.media_id!==media?.id?null:media;
+ const total=Number(preparation.total_seconds??current?.duration??0);
+ const complete=!!current?.complete;
+ const prepared=Math.max(0,Math.min(total,complete?total:Number(preparation.prepared_seconds??current?.available_duration??0)));
+ const activePosition=current&&roomState?TeamWatchSync.target(roomState,total,serverNow(),0):0;
+ const ahead=Math.max(0,prepared-activePosition);
+ $('hostPreparation').hidden=role!=='host'||!total;
+ if(role!=='host'||!total)return;
+ $('preparedThrough').textContent=preparationTime(prepared)+' / '+preparationTime(total);
+ $('preparationRemaining').textContent=preparationTime(total-prepared);
+ $('preparedAhead').textContent=current?preparationTime(ahead):'Next movie';
+ const stopped=preparation.status==='error';
+ const nearEdge=!complete&&!!current&&ahead<=30;
+ $('hostPreparation').classList.toggle('prepared-complete',complete);
+ $('hostPreparation').classList.toggle('preparation-warning',stopped||nearEdge);
+ let advice;
+ if(complete)advice='Fully prepared — the entire movie is ready. Tell participants they can connect, then check device readiness before starting.';
+ else if(stopped)advice=`Preparation stopped at ${preparationTime(prepared)}. Upload again to prepare the rest of the movie.`;
+ else if(!prepared)advice='No playable portion is prepared yet. Wait for the first segments, or wait for Fully prepared before starting the screening.';
+ else advice=`Prepared from the start through ${preparationTime(prepared)}. Beyond this point, playback may pause until processing catches up.`;
+ if(nearEdge&&!stopped&&prepared)advice+=' Playback is within 30 seconds of the prepared limit. Pause and wait, or wait for Fully prepared.';
+ if($('preparationAdvice').textContent!==advice)$('preparationAdvice').textContent=advice;
 }
 $('retryDownload').onclick=downloadTrack;
 $('clearDownloads').onclick=async()=>{if(globalThis.TeamWatchDownload)await TeamWatchDownload.clear();downloadState={};$('downloadProgress').value=0;$('downloadStatus').textContent='Device downloads cleared. Playback can stream; tap Retry download to save again.';reportStatus();};
@@ -132,11 +191,12 @@ function receiveState(data){
  if(!uploading)$('uploadStatus').textContent=data.processing.message;
  const busy=uploading||['uploading','processing','deleting'].includes(data.processing.status);
  $('upload').disabled=busy; $('file').disabled=busy;
- $('deleteMedia').disabled=busy||!media;
+ $('deleteMedia').disabled=uploading||(busy&&!data.processing.playable)||!media;
  $('currentMedia').textContent=media?`Current media: ${media.name}`:'No media in this room.';
  $('upload').textContent=media?'Upload & replace':'Upload & prepare';
  $('play').disabled=$('pause').disabled=$('restart').disabled=$('seek').disabled=$('syncAll').disabled=$('back10').disabled=$('forward10').disabled=$('jumpTime').disabled=$('jumpButton').disabled=!media;
- if(media){$('seek').max=media.duration;}
+ if(media){$('seek').max=seekLimit();}
+ renderPreparation(data.processing);renderDownload();
  notice(data.processing.status==='error'||busy?data.processing.message:(data.timeline.reason||data.processing.message));
  configureMedia(); scheduleStart(); sync();
 }
@@ -152,6 +212,8 @@ function configureMedia(){
  if(key===mediaKey)return;
  if(enabled&&roomState?.playing)command('pause');
  if(globalThis.TeamWatchDownload)TeamWatchDownload.stop();
+ if(globalThis.TeamWatchPlayer)TeamWatchPlayer.destroy();
+ playbackSource='';
  rateController.reset();playbackEvents=[];playbackCounts={};
  mediaKey=key; enabled=false; stallSince=null;downloadState={};reportStatus(); playPending=false; pendingForce=true; lastSeek=-Infinity; clearTimeout(startTimer);
  for(const el of [$('video'),$('audio')]){el.pause();el.removeAttribute('src');el.load();}
@@ -171,8 +233,12 @@ function configureMedia(){
  }
  if(media){
   const p=player(); p.muted=mode==='video';
-  p.src=`/media/${media.id}/${mode==='audio'?'audio.m4a':mode==='video'?'video.mp4':'combined.mp4'}`;
-  p.load(); downloadTrack(); $('screenTitle').textContent='Just you and the sound.';
+  playbackSource=media.format==='hls'?`/hls/${media.id}/${mode==='audio'?'audio.m3u8':mode==='video'?'video.m3u8':'master.m3u8'}`:`/media/${media.id}/${mode==='audio'?'audio.m4a':mode==='video'?'video.mp4':'combined.mp4'}`;
+  if(globalThis.TeamWatchPlayer){
+   const supported=TeamWatchPlayer.attach(p,playbackSource,message=>{notice(message);if(enabled&&roomState?.playing)command('pause');enabled=false;reportStatus();});
+   if(!supported){$('connect').disabled=true;return;}
+  }else{p.src=playbackSource;p.load();}
+  downloadTrack(); $('screenTitle').textContent='Just you and the sound.';
   $('screenText').textContent='Put on your headphones. Playback follows the host.';
  }
 }
@@ -187,7 +253,7 @@ $('connect').onclick=async()=>{
   await p.play(); enabled=true; connecting=false; sync(); reportStatus(); scheduleStart(); await keepAwake();
   $('connect').textContent='Playback connected ✓';
   $('connectHint').textContent='Keep this page visible for the best synchronization.';
- }catch(e){enabled=false;notice('Playback could not start. Wait for buffering, then tap Connect playback again.');}
+ }catch(e){enabled=false;notice(`Playback could not start: ${e.message||'wait for buffering and try again.'}`);}
  finally{connecting=false;sync();}
 };
 function targetPosition(){
@@ -195,11 +261,12 @@ function targetPosition(){
  return TeamWatchSync.target(roomState,media.duration,serverNow(),adjustment);
 }
 function sync(force=false){
+ renderHostPreparation();
  if(force)pendingForce=true;
  if(!media||!roomState)return;
  const p=player(), target=targetPosition();
  $('time').textContent=`${fmt(target)} / ${fmt(media.duration)}`;
- if(!seekDragging){$('seek').value=target;$('seekPreview').textContent=fmt(target);}
+ if(!seekDragging){$('seek').value=Math.min(target,seekLimit());$('seekPreview').textContent=fmt(target);}
  $('seek').setAttribute('aria-valuetext',fmt(Number($('seek').value))+' of '+fmt(media.duration));
  if(!enabled||connecting){$('syncStatus').textContent='Tap Connect playback';return;}
  if(ws?.readyState!==WebSocket.OPEN){p.pause();return;}
@@ -267,7 +334,7 @@ $('jumpForm').onsubmit=event=>{
  $('jumpError').textContent='';
  if(seconds===null){$('jumpError').textContent='Enter a time such as 01:23 or 01:02:03.';return;}
  if(!media){$('jumpError').textContent='Upload a movie first.';return;}
- if(seconds>media.duration){$('jumpError').textContent=`Choose a time between 00:00 and ${fmt(media.duration)}.`;return;}
+ if(seconds>seekLimit()){$('jumpError').textContent=`Choose a time between 00:00 and ${fmt(seekLimit())}${media.complete===false?' (prepared so far)':''}.`;return;}
  command('seek',{position:seconds});
 };
 $('offset').onchange=()=>{adjustment=Math.max(-2000,Math.min(2000,Number($('offset').value)||0));$('offset').value=adjustment;localStorage.setItem('tw-offset',adjustment);sync(true);};
