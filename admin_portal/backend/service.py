@@ -76,6 +76,8 @@ class Manager:
                 # Only a hash is accepted in configuration; bootstrap through the CLI below.
                 db.execute("INSERT INTO settings VALUES('password',?)", (configured,))
         self.path.chmod(0o600)
+        from episode_library import Library
+        self.library = Library(self)
         self.attach(root, 'default')
 
     async def hash_password(self, value):
@@ -135,6 +137,8 @@ class Manager:
                 if user['room_id'] == ident and not user['blocked'] and await self.verify_password(pin, user['pin_hash']):
                     return user
             return None
+        from episode_library import install_room
+        install_room(runtime, self.library, ident)
         runtime.access_check = access
         runtime.account_login = login
         runtime.ROOM_CODE = self.room(ident)['code'] if any(r['id'] == ident for r in self.rows('rooms')) else ''
@@ -185,7 +189,7 @@ class Manager:
             runtime = await self.runtime(room['id'])
             rooms.append({**room, 'media': runtime.media, 'processing': runtime.processing,
                           'connected': len(runtime.peers), 'playing': runtime.state['playing'],
-                          'position': runtime.position()})
+                          'position': runtime.position(), 'library': self.library.view(room['id'])})
             for ws, token in list(runtime.peers.items()):
                 devices.append({'room_id': room['id'], 'role': runtime.role_for(token),
                                 'ip': ws.client.host if ws.client else '', **runtime.peer_status.get(ws, {})})
@@ -194,6 +198,8 @@ class Manager:
 
     async def clear(self, ident):
         runtime = await self.runtime(ident)
+        if self.library.records(ident):
+            await self.library.clear(ident)
         # Reuse the viewer portal's cancellation and safe deletion implementation.
         result = await runtime.clear_media()
         # Also remove abandoned/failed uploads; never touch the database or other rooms.
@@ -359,7 +365,7 @@ class Manager:
         runtime = await self.runtime(ident)
         with self.db() as db:
             self.audit(db, 'media.upload', ident)
-        return await runtime.receive_upload(request)
+        return await self.library.upload(ident, request)
 
 
     async def read_audit(self):

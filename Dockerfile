@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN useradd --create-home --uid 10001 teamwatch && mkdir /app/data && chown teamwatch:teamwatch /app/data
-COPY --chown=teamwatch:teamwatch app.py media_pipeline.py ./
+COPY --chown=teamwatch:teamwatch app.py media_pipeline.py episode_library.py ./
 COPY --chown=teamwatch:teamwatch static ./static
 COPY --chown=teamwatch:teamwatch admin_portal ./admin_portal
 USER teamwatch

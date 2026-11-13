@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
+from episode_library import EditEpisode, EpisodeOrder
 from .schemas import Login, Password, Room, NewRoom, User, Confirm, Command
 from .service import ADMIN_USER, password_valid
 
@@ -118,7 +119,9 @@ def create_admin_router(manager):
         return await manager.remove_user(ident)
 
     @protected.delete('/rooms/{ident}/media')
-    async def clear_media(ident: str):
+    async def clear_media(ident: str, body: Confirm | None = None):
+        if manager.library.records(ident) and (not body or body.confirmation != 'CONFIRM'):
+            raise HTTPException(422, 'Type CONFIRM to delete the room library.')
         return await manager.clear_media(ident)
 
     @protected.delete('/media')
@@ -132,6 +135,31 @@ def create_admin_router(manager):
     @protected.post('/rooms/{ident}/upload')
     async def upload(ident: str, request: Request):
         return await manager.upload(ident, request)
+
+    @protected.get('/rooms/{room}/episodes')
+    async def episodes(room: str):
+        manager.room(room)
+        return manager.library.view(room)
+
+    @protected.patch('/rooms/{room}/episodes/{ident}')
+    async def rename_episode(room: str, ident: str, body: EditEpisode):
+        return await manager.library.rename(room, ident, body.title)
+
+    @protected.put('/rooms/{room}/episodes/order')
+    async def order_episodes(room: str, body: EpisodeOrder):
+        return await manager.library.reorder(room, body.ids)
+
+    @protected.post('/rooms/{room}/episodes/{ident}/select')
+    async def select_episode(room: str, ident: str):
+        return await manager.library.select(room, ident)
+
+    @protected.post('/rooms/{room}/episodes/{ident}/retry')
+    async def retry_episode(room: str, ident: str):
+        return await manager.library.retry(room, ident)
+
+    @protected.delete('/rooms/{room}/episodes/{ident}')
+    async def delete_episode(room: str, ident: str):
+        return await manager.library.delete(room, ident)
 
     @protected.get('/audit')
     async def audit():

@@ -23,6 +23,11 @@ ORIGIN = {'Origin': 'http://testserver'}
 
 class RoomTests(unittest.TestCase):
     def setUp(self):
+        with app.admin_manager.db() as db:
+            db.execute('DELETE FROM episodes')
+            db.execute('DELETE FROM episode_selection')
+        app.admin_manager.library.mutation = asyncio.Lock()
+        app.admin_manager.library.quota_lock = asyncio.Lock()
         app.media = None
         app.attempts.clear()
         app.sessions_revoked.clear()
@@ -41,6 +46,18 @@ class RoomTests(unittest.TestCase):
 
     def join(self, pin='8989'):
         return self.client.post('/api/join', json={'code': app.ROOM_CODE, 'pin': pin}, headers=ORIGIN)
+
+    def select_when_playable(self, response, complete=False):
+        self.assertEqual(response.status_code, 200, response.text)
+        episode_id = response.json()['id']
+        for _ in range(400):
+            episode = next(e for e in self.client.get('/api/episodes').json()['episodes'] if e['id']==episode_id)
+            if episode['status']=='ready' if complete else episode['playable']:
+                break
+            time.sleep(.025)
+        self.assertTrue(episode['playable'], episode)
+        self.assertEqual(self.client.post('/api/episodes/'+episode_id+'/select',headers=ORIGIN).status_code,200)
+        return self.client.get('/api/me').json()
 
     def fake_media(self):
         app.media = {'id': 'testmedia', 'name': 'Test movie', 'duration': 120, 'has_video': True}
@@ -408,12 +425,7 @@ class RoomTests(unittest.TestCase):
         with self.client, patch.object(app.asyncio, 'create_subprocess_exec', side_effect=paced_encoder):
             self.join('9292')
             started = time.monotonic()
-            self.assertEqual(self.client.post('/api/upload', params={'name': 'Early start'}, content=fixture.read_bytes(), headers=ORIGIN).status_code, 200)
-            for _ in range(200):
-                data = self.client.get('/api/me').json()
-                if data['processing'].get('playable'):
-                    break
-                time.sleep(.025)
+            data = self.select_when_playable(self.client.post('/api/upload', params={'name':'Early start'}, content=fixture.read_bytes(), headers=ORIGIN))
             self.assertTrue(data['processing'].get('playable'), data['processing'])
             self.assertFalse(data['media']['complete'])
             self.assertGreater(data['processing']['percent'], 0)
@@ -423,7 +435,7 @@ class RoomTests(unittest.TestCase):
             print(f'First playable segments available in {startup:.2f}s while preparation is still running.')
             ident = data['media']['id']
             self.assertEqual(self.client.get(f'/hls/{ident}/master.m3u8').status_code, 200)
-            self.assertFalse(app.job.done())
+            self.assertFalse(app.admin_manager.library.encoder_task.done())
             # Deleting an already playable movie cancels its background encoder.
             self.assertEqual(self.client.delete('/api/media', headers=ORIGIN).status_code, 200)
             self.assertIsNone(app.media)
@@ -431,7 +443,7 @@ class RoomTests(unittest.TestCase):
             self.assertFalse(app.deleting)
 
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe unavailable')
-    def test_real_upload_replace_and_delete_through_api(self):
+    def test_real_upload_select_and_delete_retains_other_episodes(self):
         fixture = app.DATA / 'api-fixture.mkv'
         subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=size=160x90:rate=12',
                         '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '1',
@@ -441,19 +453,14 @@ class RoomTests(unittest.TestCase):
             previous = None
             for name in ('First movie', 'Replacement movie'):
                 response = self.client.post('/api/upload', params={'name': name}, content=fixture.read_bytes(), headers=ORIGIN)
-                self.assertEqual(response.status_code, 200, response.text)
-                for _ in range(100):
-                    data = self.client.get('/api/me').json()
-                    if data['processing']['status'] not in ('uploading', 'processing'):
-                        break
-                    time.sleep(.05)
+                data = self.select_when_playable(response, complete=True)
                 self.assertEqual(data['processing']['status'], 'ready', data['processing'])
                 self.assertEqual(data['media']['name'], name)
                 self.assertFalse(data['timeline']['playing'])
                 self.assertEqual(data['timeline']['position'], 0)
                 if previous:
                     self.assertNotEqual(data['media']['id'], previous)
-                    self.assertFalse((app.DATA / previous).exists())
+                    self.assertTrue((app.DATA / previous).exists())
                 previous = data['media']['id']
             response = self.client.delete('/api/media', headers=ORIGIN)
             self.assertEqual(response.status_code, 200)
@@ -476,12 +483,7 @@ class RoomTests(unittest.TestCase):
             return await real_exec(*args, **kwargs)
         with self.client, patch.object(app.asyncio, 'create_subprocess_exec', side_effect=paced_encoder):
             self.join('9292')
-            self.client.post('/api/upload', params={'name': 'Keep playing'}, content=fixture.read_bytes(), headers=ORIGIN)
-            for _ in range(240):
-                data = self.client.get('/api/me').json()
-                if data['processing'].get('playable'):
-                    break
-                time.sleep(.025)
+            data = self.select_when_playable(self.client.post('/api/upload', params={'name':'Keep playing'}, content=fixture.read_bytes(), headers=ORIGIN))
             self.assertFalse(data['media']['complete'])
             app.control({'action': 'play'})
             revision, anchor = app.state['revision'], app.state['anchor']

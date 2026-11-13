@@ -1,5 +1,6 @@
 """Admin security, persistence, isolation and destructive-action regression tests."""
 import asyncio
+from contextlib import closing
 import json
 import os
 import subprocess
@@ -78,7 +79,7 @@ class AdminTests(unittest.TestCase):
         self.login()
         room=self.create_room()
         self.assertEqual(self.client.post('/api/admin/rooms',json={'code':'123456','name':'Duplicate','host_pin':'1234','viewer_pin':'5678'},headers=ORIGIN).status_code,409)
-        with TestClient(self.root.app) as viewer:
+        with closing(TestClient(self.root.app)) as viewer:
             self.assertEqual(viewer.post('/api/join',json={'code':room['code'],'pin':'5678'},headers=ORIGIN).status_code,200)
             self.assertEqual(viewer.get('/api/me').json()['room'],room['code'])
             runtime=self.manager.runtimes[room['id']]

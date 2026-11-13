@@ -78,7 +78,7 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Open http://localhost:8000. Default room code: **8889292**, viewer PIN: **8989**, host PIN: **9292**. The dictated code had seven digits despite the request describing eight; change `ROOM_CODE` to any 6–8 digit code in `.env` if needed. All devices use the same room code. PIN determines the role. This first version has one shared room, one host role, and one active movie, not separate accounts or multiple simultaneous rooms.
+Open http://localhost:8000. Default room code: **8889292**, viewer PIN: **8989**, host PIN: **9292**. The dictated code had seven digits despite the request describing eight; change `ROOM_CODE` to any 6–8 digit code in `.env` if needed. All devices use the same room code. PIN determines the role. The default room is imported once; the admin portal manages additional rooms and host/participant accounts. Each room retains a library of episodes with one active playback selection.
 
 For a VPS, put Caddy (example config included) or another HTTPS reverse proxy in front of port 8000. Point a domain to the VPS, allow ports 80/443, set `COOKIE_SECURE=true`, and restart the container. Keep port 8000 bound to localhost. The proxy must forward WebSocket upgrades and preserve the Host header. Set its upload limit at least as high as `MAX_UPLOAD_MB`. If using Nginx, also configure `client_max_body_size`, upgrade headers, and suitable upload/read timeouts. Avoid a CDN with a smaller upload limit.
 
@@ -118,7 +118,7 @@ Local Python reads environment variables, not `.env` automatically. Defaults wor
 ## Operations
 
 - Uploads default to a 10 GiB limit and stream to disk with bounded memory. Only one upload/conversion runs at a time. Full preparation can take minutes to hours, but playback opens after approximately eight seconds of complete segments exist (or the entire clip for shorter files). The progress bar shows the prepared percentage, playable duration, and preparation speed. Startup is a target rather than an unconditional two-minute guarantee: upload time, codec, storage, and VPS capacity still matter. ffmpeg video encoding is limited to two threads.
-- Allow several times the upload size in free storage: the source, video/audio segments, and the previous movie may coexist briefly before the first playable segments replace it. The source is deleted after preparation. Successfully replaced media is deleted; failed conversion folders/logs remain for diagnosis and can be manually cleaned when idle.
+- Allow space for retained source files and generated audio/video segments for every episode. New uploads do not delete existing episodes. Library deletion removes the associated source and output; cleanup failures are visible and retryable. Configure room/server quotas and a free-disk reserve in `.env`.
 - The Docker named volume retains the prepared movie across container restarts. Playback restarts paused at zero; interrupted uploads/conversions are not resumed. Repeated abrupt shutdowns can leave orphaned files needing cleanup.
 - Sessions expire after 24 hours. Set a stable random `SESSION_SECRET` to preserve signed sessions across restarts; leaving it empty generates a new secret each startup. Logout revokes the session in memory and disconnects its sockets. Rotate the secret to invalidate all sessions.
 - Host/viewer PINs are shared credentials for a small trusted group. Login is rate-limited per source IP (10 failed attempts/5 minutes), media requires a session, mutations require same-origin requests, and only hosts can upload, seek, restart, or sync all devices. All joined participants can play/pause the room. Behind a proxy, configure trusted proxy IPs correctly to preserve client IP rate limiting. Default proxy trust is loopback only.
@@ -195,19 +195,17 @@ activate before setting up media playback.
 
 Host navigation preserves the current play/pause state. Ten-second jumps use the server position, so device timing adjustments do not change where the room lands. Slider dragging previews a position and commits the room seek on release.
 
-## Replacing or deleting current media
+## Series libraries and episode selection
 
-The host library shows the current filename. **Upload & replace** keeps the current
-movie available while a replacement uploads and its first segments prepare. Once playable, the room
-switches to the new segmented stream after the first playable portion is ready, pauses at zero, clears device readiness, and asks everyone
-to connect playback again. Old media is removed after successful replacement.
-If preparation fails before the new movie is playable, the previous movie remains. If background preparation fails after switching, the room pauses, retains the prepared portion, and shows an error; reupload to prepare the entire file.
+Each room has a retained episode library. Hosts can select multiple files, review titles/order and upload them sequentially. A single server-wide worker prepares accepted uploads in the background and rotates fairly between rooms. Each entry reports queued/preparing/partly ready/fully ready/failed status and prepared duration.
 
-**Delete current media** is host-only and asks for confirmation. It stops playback
-for everyone, clears the saved current-media record so it cannot reappear on restart,
-removes its prepared server files, and clears connected clients' player sources and
-download cache. Deletion waits during upload/initial preparation, but is allowed once the new movie is playable: it cancels its remaining background encoder before clearing the room, preventing the job from restoring deleted media. Storage permission
-failures are reported. After deletion, a fresh upload starts from an empty room.
+Upload does not select, replace or delete the current episode. Use **Select episode** or **Next episode** to switch; confirm the action, wait for device readiness, then press Play. Switching pauses at zero and invalidates old readiness/control messages. Participants remain in the room. Autoplay is intentionally not included.
+
+Hosts can rename, reorder, retry and delete episodes. Deleting the active episode stops playback. Deleting a whole library requires typing `CONFIRM`; rooms and accounts remain. Admins manage the same libraries from `/admin`. Existing media is migrated automatically without moving its files.
+
+Defaults: `ROOM_STORAGE_MB=51200`, `SERVER_STORAGE_MB=204800`, `MIN_FREE_DISK_MB=512`; values are MiB and account for retained sources plus output. Continue running one Uvicorn worker. Back up the complete data volume before upgrading or rolling back.
+
+See the [series user guide](docs/project/viewers-portal/using-guide.md) and [implementation notes](docs/project/viewers-portal/implementation.md).
 
 ## Fast-start preparation and progress
 
@@ -225,8 +223,8 @@ under two minutes is not possible for every codec/VPS/network; upload time is
 separate, and an encoder slower than playback can still require buffering pauses.
 
 A preparation job interrupted by restart is not automatically resumed. Any
-published portion remains available and is labeled interrupted; upload again for
-the full movie. Old fully prepared MP4/M4A files are still supported by this release.
+published portion remains available and is labeled interrupted. Use Retry preparation
+when the retained source is available, or upload the file again. Queued uploads resume automatically. Old fully prepared MP4/M4A files are still supported by this release.
 An older application release cannot play the new HLS layout; rolling back across
 this change requires restoring the previous media backup or uploading again.
 

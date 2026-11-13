@@ -56,7 +56,7 @@ $('joinForm').onsubmit = async e => {
 async function enter(){
  const data=await api('/api/me'); role=data.role;
  $('login').hidden=true; $('room').hidden=false; $('logout').hidden=false;
- $('hostControls').hidden=role!=='host'; $('uploadPanel').hidden=role!=='host';
+ $('hostControls').hidden=role!=='host'; $('uploadPanel').hidden=true;
  $('roomLabel').textContent=`ROOM ${data.room} · ${role.toUpperCase()}`;
  if(globalThis.TeamWatchDownload)await TeamWatchDownload.ready();
  receiveState(data); openSocket();
@@ -64,7 +64,7 @@ async function enter(){
 function openSocket(){
  clearInterval(pingTimer); clearTimeout(reconnect);
  ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`);
- ws.onopen=()=>{clockSamples=[]; measureClock(); pingTimer=setInterval(ping,2000);};
+ ws.onopen=()=>{if(globalThis.TeamWatchLibrary)TeamWatchLibrary.connection(true);clockSamples=[]; measureClock(); pingTimer=setInterval(ping,2000);};
  ws.onmessage=e=>{
   const data=JSON.parse(e.data);
   if(data.type==='pong'){
@@ -79,6 +79,7 @@ function openSocket(){
   else if(data.type==='error') notice(data.message);
  };
  ws.onclose=e=>{
+  if(globalThis.TeamWatchLibrary)TeamWatchLibrary.connection(false);
   clearInterval(pingTimer); clearTimeout(startTimer); clockTimers.forEach(clearTimeout); $('connection').textContent='Disconnected from room';
   $('video').pause(); $('audio').pause();
   if(leaving)return;
@@ -91,7 +92,7 @@ function ping(){if(ws?.readyState===WebSocket.OPEN){reportStatus();ws.send(JSON.
 function reportStatus(){
  if(ws?.readyState!==WebSocket.OPEN||!media)return;
  const p=player();
- ws.send(JSON.stringify({type:'status',media_id:media.id,active:enabled,ready:enabled&&!p.seeking&&p.readyState>=3,mode,drift:roomState?targetPosition()-p.currentTime:null,downloaded:downloadState.status==='complete'}));
+ ws.send(JSON.stringify({type:'status',media_id:media.id,episode_id:media.episode_id,selection_revision:roomState?.selection_revision,revision:roomState?.revision,active:enabled,ready:enabled&&!p.seeking&&p.readyState>=3,mode,drift:roomState?targetPosition()-p.currentTime:null,downloaded:downloadState.status==='complete'}));
 }
 function downloadTrack(){
  if(!media||!globalThis.TeamWatchDownload)return;
@@ -179,6 +180,7 @@ function scheduleStart(){
  if(wait>0)startTimer=setTimeout(()=>{if(serverNow()<roomState.anchor)scheduleStart();else sync();},Math.max(1,Math.min(wait,2147483647)));
 }
 function receiveState(data){
+ if(globalThis.TeamWatchLibrary)TeamWatchLibrary.update(data.library,role==='host',ws?.readyState===WebSocket.OPEN);
  if(!clockSamples.length)clockOffset=data.server_time-localNow();
  const changed=roomState?.revision!==data.timeline.revision;
  roomState=data.timeline; media=data.media;
@@ -190,10 +192,10 @@ function receiveState(data){
  $('movieName').textContent=media?.name || 'Your shared cinema';
  if(!uploading)$('uploadStatus').textContent=data.processing.message;
  const busy=uploading||['uploading','processing','deleting'].includes(data.processing.status);
- $('upload').disabled=busy; $('file').disabled=busy;
+ if(!globalThis.TeamWatchLibrary){$('upload').disabled=busy; $('file').disabled=busy;}
  $('deleteMedia').disabled=uploading||(busy&&!data.processing.playable)||!media;
  $('currentMedia').textContent=media?`Current media: ${media.name}`:'No media in this room.';
- $('upload').textContent=media?'Upload & replace':'Upload & prepare';
+ if(!globalThis.TeamWatchLibrary)$('upload').textContent=media?'Upload & replace':'Upload & prepare';
  $('play').disabled=$('pause').disabled=$('restart').disabled=$('seek').disabled=$('syncAll').disabled=$('back10').disabled=$('forward10').disabled=$('jumpTime').disabled=$('jumpButton').disabled=!media;
  if(media){$('seek').max=seekLimit();}
  renderPreparation(data.processing);renderDownload();
@@ -318,7 +320,7 @@ function command(action,extra={}){
  if(ws?.readyState!==WebSocket.OPEN){notice('Wait for the room connection.');return;}
  recordPlayback('command:'+action);
  if(action==='play')reportStatus();
- ws.send(JSON.stringify({type:'control',action,...extra}));
+ ws.send(JSON.stringify({type:'control',action,episode_id:media?.episode_id,selection_revision:roomState?.selection_revision,revision:roomState?.revision,...extra}));
 }
 $('play').onclick=()=>command('play'); $('pause').onclick=()=>command('pause');
 $('syncAll').onclick=()=>command('sync');
@@ -351,24 +353,6 @@ $('deleteMedia').onclick=async()=>{
   if(!response.ok)throw Error(data.detail||'Could not delete media.');
   if(!roomState||data.timeline.revision>=roomState.revision)receiveState(data);
  }catch(error){notice(error.message);$('uploadStatus').textContent=error.message;$('deleteMedia').disabled=!media;}
-};
-$('upload').onclick=()=>{
- const file=$('file').files[0]; if(!file){notice('Choose a movie or song first.');return;}
- uploading=true;$('upload').disabled=true;$('file').disabled=true;$('deleteMedia').disabled=true;$('uploadProgress').value=0;$('uploadProgress').hidden=false;$('uploadStatus').textContent='Uploading…';
- const xhr=new XMLHttpRequest();xhr.open('POST',`/api/upload?name=${encodeURIComponent(file.name)}`);
- xhr.setRequestHeader('Content-Type','application/octet-stream');
- xhr.upload.onprogress=e=>{if(e.lengthComputable){$('uploadProgress').value=e.loaded/e.total*100;$('uploadStatus').textContent=`Uploading ${Math.round(e.loaded/e.total*100)}%`;}};
- xhr.onload=async()=>{
-  uploading=false;
-  $('uploadProgress').hidden=true;
-  if(xhr.status>=200&&xhr.status<300){
-   try{receiveState(await api('/api/me'));}
-   catch{notice('Upload received. Check preparation status when the room reconnects.');}
-  }
-  else{let message='Upload failed.';try{message=JSON.parse(xhr.responseText).detail||message;}catch{}notice(message);$('uploadStatus').textContent=message;$('upload').disabled=false;$('file').disabled=false;$('deleteMedia').disabled=!media;}
- };
- xhr.onerror=()=>{uploading=false;const message='Upload connection failed. Check the current media and preparation status before retrying.';notice(message);$('uploadStatus').textContent=message;$('upload').disabled=false;$('file').disabled=false;$('deleteMedia').disabled=!media;$('uploadProgress').hidden=true;};
- xhr.send(file);
 };
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){measureClock();sync(true);scheduleStart();if(enabled)keepAwake();}});
 for(const p of [$('video'),$('audio')]){

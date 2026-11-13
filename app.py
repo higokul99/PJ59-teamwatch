@@ -90,7 +90,8 @@ def snapshot():
     return {'type': 'state', 'timeline': state.copy(), 'media': media,
             'processing': processing.copy(), 'count': len(peers),
             'participants': [peer_status.get(ws, {'active': False, 'ready': False}) for ws in peers],
-            'server_time': time.time()}
+            'server_time': time.time(),
+            'library': library_service.view(library_room) if globals().get('library_service') else None}
 
 
 async def broadcast():
@@ -256,7 +257,8 @@ async def process(source, ident, name):
         preparing_id = None
         upload_busy = False
         try:
-            source.unlink(missing_ok=True)
+            if not globals().get('KEEP_UPLOAD_SOURCE'):
+                source.unlink(missing_ok=True)
         except OSError:
             processing['message'] += ' Source upload could not be removed; check storage permissions.'
         await broadcast()
@@ -287,8 +289,13 @@ async def lifespan(app):
                 processing = {'status': 'ready', 'message': 'Movie restored. Playback starts paused.'}
         except (ValueError, KeyError):
             pass
+    if globals().get('admin_manager'):
+        await admin_manager.library.start()
+    elif globals().get('library_service'):
+        library_service.migrate(library_runtime, library_room)
     yield
     if globals().get('admin_manager'):
+        await admin_manager.library.stop()
         for ident, runtime in list(admin_manager.runtimes.items()):
             if ident != 'default':
                 await runtime.room_lifespan.__aexit__(None, None, None)
@@ -384,6 +391,8 @@ async def me(request: Request):
 @app.post('/api/upload')
 async def upload(request: Request):
     auth(request, host=True)
+    if globals().get('library_service') and library_service.selection(library_room) is not None:
+        return await library_service.upload(library_room, request)
     return await receive_upload(request)
 
 
@@ -427,6 +436,9 @@ async def receive_upload(request):
 @app.delete('/api/media')
 async def delete_media(request: Request):
     auth(request, host=True)
+    if media and media.get('episode_id') and globals().get('library_service'):
+        await library_service.delete(library_room, media['episode_id'])
+        return {'ok': True, **snapshot()}
     return await clear_media()
 
 
@@ -592,6 +604,8 @@ async def websocket(ws: WebSocket):
                 # participate in the play barrier and disconnect-pause rule.
                 if not media or body.get('media_id') != media['id']:
                     continue
+                if media.get('episode_id') and (body.get('episode_id') != media['episode_id'] or body.get('selection_revision') != state.get('selection_revision') or body.get('revision') != state['revision']):
+                    continue
                 peer_status[ws] = {
                     'active': body.get('active') is True,
                     'ready': body.get('ready') is True,
@@ -600,6 +614,9 @@ async def websocket(ws: WebSocket):
                     'drift': body.get('drift') if isinstance(body.get('drift'), (float, int)) and math.isfinite(body['drift']) else None,
                 }
             elif body.get('type') == 'control':
+                if media and media.get('episode_id') and (body.get('episode_id') != media['episode_id'] or body.get('selection_revision') != state.get('selection_revision') or body.get('revision') != state['revision']):
+                    await send(ws, {'type':'error','message':'Episode changed. Wait for the current room state.'})
+                    continue
                 action = body.get('action')
                 if role != 'host' and action not in ('play', 'pause', 'buffering'):
                     await send(ws, {'type': 'error', 'message': 'Only the host can seek, skip, restart, or sync all devices.'})
