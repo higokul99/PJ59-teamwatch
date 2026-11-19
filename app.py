@@ -17,7 +17,8 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from media_pipeline import (STARTUP_SECONDS, available_seconds, build_command, finish_partial, video_stream, write_master)
+from media_pipeline import (STARTUP_SECONDS, available_seconds, build_command, build_subtitle_command,
+                            describe_audio, describe_subtitles, finish_partial, video_stream, write_master)
 
 BASE = Path(__file__).resolve().parent
 DATA = Path(globals().get('ROOM_DATA', os.getenv('DATA_DIR', str(BASE / 'data'))))
@@ -135,11 +136,46 @@ async def read_encoder_progress(stream, metrics):
                 pass
 
 
+def ready_subtitles(folder, tracks):
+    """Only advertise WebVTT files ffmpeg has actually finished writing."""
+    ready = []
+    for track in tracks:
+        path = folder / 'subtitles' / f"{track['id']}.vtt"
+        try:
+            with path.open('rb') as handle:
+                if handle.read(6) == b'WEBVTT':
+                    ready.append(track)
+        except OSError:
+            pass
+    return ready
+
+
+async def extract_subtitles(args, folder):
+    """Best-effort text subtitles. A failure must never stop playable encoding."""
+    proc = log = None
+    try:
+        log = (folder / 'subtitles.log').open('wb')
+        proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL, stderr=log)
+        await proc.wait()
+    except asyncio.CancelledError:
+        if proc and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        raise
+    except Exception:
+        pass
+    finally:
+        if log:
+            log.close()
+
+
 async def process(source, ident, name):
     global media, processing, upload_busy, preparing_id
     folder = DATA / ident
     proc = None
     reader = None
+    subtitle_task = None
+    subtitle_tracks = []
     published = False
     candidate = None
     preparing_id = ident
@@ -158,10 +194,19 @@ async def process(source, ident, name):
         has_video = video_stream(info) is not None
         if not any(s['codec_type'] == 'audio' for s in info['streams']) or not math.isfinite(duration) or duration <= 0:
             raise ValueError('Choose a movie or song with an audio track and a finite duration.')
-        args, copied = build_command(source, folder, info, INPUT_OPTIONS)
-        write_master(folder, has_video)
+        audio_tracks = describe_audio(info)
+        subtitle_tracks = describe_subtitles(info)
+        args, copied = build_command(source, folder, info, INPUT_OPTIONS, audio_tracks)
+        write_master(folder, has_video, audio_tracks)
         candidate = {'id': ident, 'name': name[:200], 'duration': duration, 'has_video': has_video,
-                     'format': 'hls', 'complete': False, 'preparing': True, 'available_duration': 0}
+                     'format': 'hls', 'complete': False, 'preparing': True, 'available_duration': 0,
+                     'audio_tracks': audio_tracks, 'subtitle_tracks': []}
+        if subtitle_tracks:
+            # A second, short ffmpeg pass reads the same source and writes WebVTT
+            # sidecars. It is isolated so a broken subtitle stream cannot block
+            # the playable video/audio preparation.
+            subtitle_task = asyncio.create_task(extract_subtitles(
+                build_subtitle_command(source, folder, subtitle_tracks, INPUT_OPTIONS), folder))
         metrics = {}
         last_update = -1
 
@@ -169,6 +214,10 @@ async def process(source, ident, name):
             nonlocal published, last_update
             global media, processing
             available = min(duration, await asyncio.to_thread(available_seconds, folder, has_video))
+            subtitles = await asyncio.to_thread(ready_subtitles, folder, subtitle_tracks)
+            # Only advertise tracks whose file is complete enough to parse.
+            subtitle_change = subtitles != candidate['subtitle_tracks']
+            candidate['subtitle_tracks'] = subtitles
             candidate['available_duration'] = duration if done else available
             candidate['complete'] = done
             candidate['preparing'] = not done
@@ -176,7 +225,7 @@ async def process(source, ident, name):
             if ready and not published:
                 old = media
                 candidate['startup_seconds'] = round(time.monotonic() - started, 2)
-                write_master(folder, has_video)
+                write_master(folder, has_video, audio_tracks)
                 save_media(candidate)
                 media = candidate
                 reset_playback('First segments ready. Connect playback; the rest prepares in the background.')
@@ -185,7 +234,7 @@ async def process(source, ident, name):
                     await asyncio.to_thread(shutil.rmtree, DATA / old['id'], True)
             if published:
                 media = candidate
-                if int(available) != last_update or done:
+                if int(available) != last_update or done or subtitle_change:
                     save_media(candidate)
             percent = 100 if done else min(99.9, available / duration * 100)
             message = ('Fully prepared. All positions are available.' if done else
@@ -196,8 +245,9 @@ async def process(source, ident, name):
                           'percent': percent, 'prepared_seconds': duration if done else available,
                           'total_seconds': duration, 'playable': published, 'speed': metrics.get('speed'),
                           'elapsed_seconds': round(time.monotonic() - started),
-                          'video_copied': copied, 'startup_seconds': candidate.get('startup_seconds'), 'media_id': ident}
-            if int(available) != last_update or done:
+                          'video_copied': copied, 'startup_seconds': candidate.get('startup_seconds'),
+                          'audio_tracks': len(audio_tracks), 'subtitle_tracks': len(subtitles), 'media_id': ident}
+            if int(available) != last_update or done or subtitle_change:
                 last_update = int(available)
                 await broadcast()
 
@@ -213,16 +263,29 @@ async def process(source, ident, name):
             raise ValueError('Background preparation failed. Check the conversion log and try another upload.')
         if await asyncio.to_thread(available_seconds, folder, has_video) <= 0:
             raise ValueError('No playable media segments were produced.')
+        if subtitle_task:
+            # The main encode is the long job; this normally finished long ago.
+            try:
+                await asyncio.wait_for(subtitle_task, 300)
+            except (asyncio.TimeoutError, TimeoutError):
+                subtitle_task.cancel()
+                await asyncio.gather(subtitle_task, return_exceptions=True)
+            subtitle_task = None
         await update(done=True)
     except asyncio.CancelledError:
         if proc and proc.returncode is None:
             proc.kill()
             await proc.wait()
+        if subtitle_task:
+            subtitle_task.cancel()
+            await asyncio.gather(subtitle_task, return_exceptions=True)
+            subtitle_task = None
         processing = {'status': 'error', 'message': 'Preparation interrupted. Upload again to prepare the whole movie.',
                       'percent': processing.get('percent', 0), 'playable': published, 'media_id': ident}
         if published:
             candidate['preparing'] = False
             candidate['complete'] = False
+            candidate['subtitle_tracks'] = ready_subtitles(folder, subtitle_tracks)
             reset_playback('Preparation interrupted. Only the prepared portion is available; upload again to finish.')
             try:
                 finish_partial(folder, candidate['has_video'])
@@ -236,6 +299,10 @@ async def process(source, ident, name):
         if proc and proc.returncode is None:
             proc.kill()
             await proc.wait()
+        if subtitle_task:
+            subtitle_task.cancel()
+            await asyncio.gather(subtitle_task, return_exceptions=True)
+            subtitle_task = None
         detail = str(exc) if isinstance(exc, ValueError) else 'Media preparation failed. Check ffmpeg and available disk space.'
         processing = {'status': 'error', 'message': detail +
                       (' Only the prepared portion is available; upload again.' if published else
@@ -244,6 +311,7 @@ async def process(source, ident, name):
         if published:
             candidate['preparing'] = False
             candidate['complete'] = False
+            candidate['subtitle_tracks'] = ready_subtitles(folder, subtitle_tracks)
             reset_playback('Background preparation stopped. Only the prepared portion is available.')
             try:
                 finish_partial(folder, candidate['has_video'])
@@ -254,6 +322,9 @@ async def process(source, ident, name):
         if reader and not reader.done():
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
+        if subtitle_task and not subtitle_task.done():
+            subtitle_task.cancel()
+            await asyncio.gather(subtitle_task, return_exceptions=True)
         preparing_id = None
         upload_busy = False
         try:
@@ -492,7 +563,9 @@ def hls_path(ident, asset):
     if not media or media['id'] != ident or media.get('format') != 'hls':
         raise HTTPException(404)
     import re
-    allowed = asset in ('master.m3u8', 'video.m3u8', 'audio.m3u8') or re.fullmatch(r'(audio|video)/(index\.m3u8|init\.mp4|segment_\d{6,}\.m4s)', asset)
+    allowed = (asset in ('master.m3u8', 'video.m3u8') or re.fullmatch(r'audio\d*\.m3u8', asset)
+               or re.fullmatch(r'(audio\d*|video)/(index\.m3u8|init\.mp4|segment_\d{6,}\.m4s)', asset)
+               or re.fullmatch(r'subtitles/s\d+\.vtt', asset))
     if not allowed:
         raise HTTPException(404)
     path = DATA / ident / asset
@@ -501,13 +574,19 @@ def hls_path(ident, asset):
     return path
 
 
+def hls_media_type(asset):
+    if asset.endswith('.vtt'):
+        return 'text/vtt'
+    return 'audio/mp4' if asset.startswith('audio') else 'video/mp4'
+
+
 @app.get('/api/hls/{ident}/{asset:path}')
 async def hls_details(ident: str, asset: str, request: Request):
     auth(request)
     path = hls_path(ident, asset)
     if asset.endswith('.m3u8'):
         raise HTTPException(404)
-    return {'size': path.stat().st_size, 'type': 'audio/mp4' if asset.startswith('audio/') else 'video/mp4'}
+    return {'size': path.stat().st_size, 'type': hls_media_type(asset)}
 
 
 @app.get('/hls/{ident}/{asset:path}')
@@ -519,7 +598,7 @@ async def hls_asset(ident: str, asset: str, request: Request):
         if '#EXT-X-START' not in text:
             text = text.replace('#EXTM3U', '#EXTM3U\n#EXT-X-START:TIME-OFFSET=0,PRECISE=YES', 1)
         return Response(text, media_type='application/vnd.apple.mpegurl', headers={'Cache-Control': 'no-store'})
-    return FileResponse(path, media_type='audio/mp4' if asset.startswith('audio/') else 'video/mp4',
+    return FileResponse(path, media_type=hls_media_type(asset),
                         headers={'Cache-Control': 'private, no-cache'})
 
 

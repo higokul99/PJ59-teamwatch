@@ -1,7 +1,7 @@
 # PRD: Room Series Library and Episode Queue
 
 - Product: TeamWatch — Viewers Portal
-- Status: MVP implemented locally; pending deployment and staging acceptance
+- Status: Proposed; not implemented
 - Date: 13 November 2026
 - Delivery: MVP first; autoplay in a later phase
 - Related documents: [UI design](ui-design.md), [User guide](using-guide.md), [Technical interview notes](technical_doc_for_interview.md)
@@ -28,7 +28,7 @@ All checks must be enforced on the server, including media URLs and WebSockets.
 
 ### Upload and library
 
-- Accept a multi-file selection, including at least eight episodes when configured storage limits permit.
+- Accept a multi-file selection, 1-30 eposide is the allowed limit, Let this count be controlled via admin portal.
 - Upload one file at a time per browser queue. Show each filename, transfer percentage and any failure.
 - Save each episode under an immutable ID; uploading another episode must not delete or select existing content.
 - Let the host edit titles and episode order. Filenames can suggest titles, but must not be trusted as paths or definitive episode numbers.
@@ -90,14 +90,3 @@ Measure time from upload completion to first playable media, preparation through
 ## Later phase: autoplay
 
 Opt-in autoplay should advance only after authoritative end-of-episode detection, sufficient preparation of the next episode and readiness from participating devices. Disconnected or unready devices need a documented policy before enabling this behavior. Manual Next remains available.
-
-
-## Implementation notes
-
-The local implementation uses `episode_library.py` for persistence, fair scheduling, quotas and episode operations. Durable job state/generation is stored on each episode record in `admin.sqlite3`, alongside a separate `episode_selection` table. A separate job table is not required for the one-worker MVP. Each episode retains its source so failed preparation can be retried; deletion removes both source and output.
-
-Viewer controls are implemented in `static/library.js`. Admin Media library cards expose per-episode selection, rename, reordering, retry and deletion through the same service. Existing `/api/upload` clients add episodes in a running application; uploads no longer implicitly select or replace content. The current-selection manifest is maintained for compatible older readers, but older admin cleanup code is not library-aware: back up the volume before an upgrade or rollback.
-
-Preparation quotas are checked throughout uploads and every 250ms during encoding. FFmpeg may write additional bytes between checks; the free-disk reserve is a safeguard, not an exact byte-perfect boundary. Initial defaults are 50 GiB per room, 200 GiB server-wide and 512 MiB free-disk reserve, configurable through environment variables. Completed source files count toward usage.
-
-Autoplay, resumable uploads, adaptive bitrate and distributed workers remain outside this release. A restarted in-progress preparation becomes explicitly failed/partial and can be retried; queued accepted uploads resume automatically. See [implementation and test notes](implementation.md) for verification and operational limits.

@@ -2,6 +2,8 @@
 
 Status: implemented in this checkout; not deployed by this task.
 
+Related discussion: [Media preparation performance and 4×/8× targets](media-preparation-performance.md).
+
 ## Components
 
 - `episode_library.py`: SQLite-backed episode/job state, selection revisions, legacy migration, retained sources, quotas, one fair preparation worker, and shared viewer/admin operations.

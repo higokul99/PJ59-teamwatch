@@ -18,3 +18,21 @@ input:not([type=range]){background:#101010}input[type=file]::file-selector-butto
 .host-preparation{margin:16px 0;padding:16px;border:1px solid var(--line);border-radius:12px;background:rgba(128,128,128,.06)}.preparation-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.preparation-stats small{display:block;margin-bottom:8px}.preparation-stats strong{display:block;font-size:16px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.host-preparation.prepared-complete{border-color:#4d9b71;background:rgba(77,155,113,.1)}.host-preparation.preparation-warning{border-color:#c28c36;background:rgba(194,140,54,.1)}#preparationAdvice{line-height:1.6;font-weight:600}@media(max-width:600px){.preparation-stats{grid-template-columns:1fr;gap:12px}.preparation-stats>div{display:flex;justify-content:space-between;gap:12px}.preparation-stats small{max-width:50%;margin:0}.preparation-stats strong{text-align:right}}
 
 .episode-card{border:1px solid var(--line);border-radius:12px;padding:14px;margin:14px 0}.episode-active{border-color:var(--accent)}.episode-heading{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.episode-heading h3{margin:0;overflow-wrap:anywhere}.episode-heading span,.episode-card p{font-size:12px}.episode-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.episode-actions button{width:auto;font-size:12px;padding:9px}.upload-queue-row{display:grid;gap:7px;margin:12px 0;overflow-wrap:anywhere}.upload-queue-row span{font-size:12px}#episodeDialog{width:calc(100% - 32px);max-width:480px;border:1px solid var(--line);border-radius:16px;padding:24px;background:var(--panel,#171717);color:inherit}#episodeDialog::backdrop{background:#0009}#libraryStorage{overflow-wrap:anywhere;font-size:12px}#libraryHostTools{margin:16px 0}.episode-card progress{width:100%}
+
+/* VLC-style per-device audio-language and subtitle controls over the player. */
+.player-tools{position:absolute;top:12px;right:12px;left:12px;display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;align-items:flex-start;z-index:4}
+.track-control{position:relative}
+.track-button{display:flex;align-items:center;gap:6px;max-width:44vw;padding:6px 12px;font-size:12px;font-weight:600;background:#0c0c0cd9;border:1px solid #4a4a4a;border-radius:999px;color:var(--text);backdrop-filter:blur(4px)}
+.track-button:hover{background:#202020e6}
+.track-button.active{border-color:var(--accent);color:var(--accent)}
+.track-icon{font-size:13px;line-height:1}
+.track-icon.cc{font-size:10px;font-weight:800;letter-spacing:.5px;border:1px solid currentColor;border-radius:3px;padding:0 3px}
+#audioTrackLabel,#subtitleTrackLabel{max-width:26vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.track-menu{position:absolute;right:0;top:calc(100% + 8px);min-width:190px;max-width:min(280px,70vw);max-height:50vh;overflow:auto;display:grid;gap:2px;padding:6px;background:#141414f2;border:1px solid var(--line);border-radius:12px;box-shadow:0 18px 40px #000a;z-index:5}
+.track-option{display:flex;align-items:center;justify-content:space-between;gap:14px;width:100%;padding:9px 10px;font-size:13px;font-weight:600;text-align:left;color:var(--text);background:transparent;border:0;border-radius:8px}
+.track-option:hover,.track-option:focus-visible{background:#262626;outline:none}
+.track-option[aria-checked=true]{color:var(--accent)}
+.track-check{color:var(--accent)}
+video::cue{background:#000000c7;color:#fff;font-size:1.05em;line-height:1.35}
+.screen:fullscreen .player-tools{top:18px;right:18px}
+@media(max-width:680px){.track-button{padding:5px 9px;font-size:11px}.track-menu{max-height:40vh}}

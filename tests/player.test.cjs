@@ -3,9 +3,10 @@ const vm=require('node:vm'),fs=require('node:fs'),path=require('node:path');
 function playerHarness(native=false,supported=true){
  const engines=[];
  class Hls{
-  static Events={ERROR:'error'};static isSupported(){return supported;}
-  constructor(config){this.config=config;engines.push(this);}
-  on(name,callback){this.callback=callback;}
+  static Events={ERROR:'error',MANIFEST_PARSED:'manifestparsed'};static isSupported(){return supported;}
+  constructor(config){this.config=config;this.callbacks={};engines.push(this);}
+  on(name,callback){this.callbacks[name]=callback;}
+  fire(name){this.callbacks[name]?.();}
   loadSource(value){this.source=value;}
   attachMedia(value){this.media=value;}
   destroy(){this.destroyed=true;}
@@ -32,4 +33,27 @@ test('unsupported browser reports an error without pretending playback is ready'
  const h=playerHarness(false,false);let message='';
  assert.equal(h.api.attach(h.element,'/hls/id/master.m3u8',error=>message=error),false);
  assert.ok(message.includes('does not support'));
+});
+test('MSE audio language selection waits for the manifest and uses alternate audio tracks',()=>{
+ const h=playerHarness();let ready=0;
+ assert.equal(h.api.attach(h.element,'/hls/id/master.m3u8',()=>{}, {onReady:()=>ready++}),true);
+ const engine=h.engines[0];
+ engine.audioTracks=[{name:'English',lang:'eng'},{name:'Hindi',lang:'hin'}];
+ assert.equal(ready,0);
+ engine.fire('manifestparsed');
+ assert.equal(ready,1);
+ assert.equal(h.api.selectAudio(1,{label:'Hindi'}),true);
+ assert.equal(engine.audioTrack,1);
+ assert.equal(h.api.selectAudio(0,{label:'English'}),true);
+ assert.equal(engine.audioTrack,0);
+ assert.equal(h.api.selectAudio(5,{label:'Missing'}),false);
+});
+test('native HLS enables the chosen alternate audio track',()=>{
+ const h=playerHarness(true,false);
+ h.element.audioTracks=[{enabled:true},{enabled:false}];
+ assert.equal(h.api.attach(h.element,'/hls/id/master.m3u8',()=>{}),true);
+ assert.equal(h.api.selectAudio(1,{label:'Hindi'}),true);
+ assert.equal(h.element.audioTracks[0].enabled,false);
+ assert.equal(h.element.audioTracks[1].enabled,true);
+ assert.equal(h.api.selectAudio(3,{label:'Missing'}),false);
 });

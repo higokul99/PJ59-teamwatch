@@ -47,7 +47,7 @@ async function prune(mediaId){
 function mediaPath(raw){
  const url=new URL(raw,self.location.origin);
  const legacy=/^\/media\/[a-f0-9]{24}\/(audio\.m4a|video\.mp4|combined\.mp4)$/.test(url.pathname);
- const hls=/^\/hls\/[a-f0-9]{24}\/(audio|video)\/(init\.mp4|segment_\d{6,}\.m4s)$/.test(url.pathname);
+ const hls=/^\/hls\/[a-f0-9]{24}\/(audio\d*|video)\/(init\.mp4|segment_\d{6,}\.m4s)$/.test(url.pathname);
  if(url.origin!==self.location.origin||(!legacy&&!hls))throw Error('Invalid media path');
  return url.pathname;
 }

@@ -63,15 +63,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 function browserHarness(){
  let elapsed=0;
- const nodes=new Map(),timers=[],outbox=[];
+ const nodes=new Map(),timers=[],outbox=[],store={};
  function node(id){
   if(!nodes.has(id))nodes.set(id,{value:0,disabled:false,hidden:false,currentTime:0,readyState:4,paused:true,seeking:false,playbackRate:1,plays:0,
-   classList:{toggle(){}},setAttribute(name,value){this[name]=value;},removeAttribute(name){delete this[name];},getAttribute(name){return this[name]||null;},load(){},addEventListener(){},pause(){this.paused=true;},
+   classList:{toggle(){}},setAttribute(name,value){this[name]=value;},removeAttribute(name){delete this[name];},getAttribute(name){return this[name]||null;},load(){},addEventListener(){},pause(){this.paused=true;},querySelectorAll(){return [];},querySelector(){return null;},appendChild(){},remove(){},
    play(){this.paused=false;this.plays++;return Promise.resolve();}});
   return nodes.get(id);
  }
- const context=vm.createContext({console,Date:{now:()=>100000},performance:{now:()=>elapsed},localStorage:{getItem:()=>null,setItem(){}},
-  document:{getElementById:node,querySelectorAll:()=>[],addEventListener(){},activeElement:null},
+ const context=vm.createContext({console,Date:{now:()=>100000},performance:{now:()=>elapsed},localStorage:{getItem:key=>store[key]??null,setItem(key,value){store[key]=String(value);}},
+  document:{getElementById:node,querySelectorAll:()=>[],addEventListener(){},activeElement:null,createElement(){return {dataset:{},classList:{toggle(){}},style:{},setAttribute(){},append(){},addEventListener(){}};}},
   navigator:{},fetch:()=>Promise.reject(Error('Not signed in')),WebSocket:{OPEN:1},
   outbox,setInterval(){},clearInterval(){},setTimeout(fn,delay){timers.push({fn,delay});return timers.length;},clearTimeout(){}});
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../static/sync.js'),'utf8'),context);
@@ -269,4 +269,44 @@ test('new upload does not inherit full readiness from the previous movie',()=>{
  assert.ok(!h.node('preparationAdvice').textContent.startsWith('Fully prepared'));
  h.run('role="viewer";renderHostPreparation();');
  assert.equal(h.node('hostPreparation').hidden,true);
+});
+
+test('audio and subtitle choices stay on this device and drive the next media load',()=>{
+ const h=browserHarness();
+ h.run('media={id:"movie",duration:200,has_video:true,format:"hls",audio_tracks:[{id:"audio",label:"English",language:"eng",default:true},{id:"audio2",label:"Hindi",language:"hin",channels:6}],subtitle_tracks:[{id:"s0",label:"English",language:"eng"}]};mode="combined";updateTrackButtons();');
+ assert.equal(h.node('audioMenuButton').hidden,false);
+ assert.equal(h.node('subtitleMenuButton').hidden,false);
+ assert.equal(h.node('audioTrackLabel').textContent,'English');
+ assert.equal(h.node('subtitleTrackLabel').textContent,'Off');
+ h.run('chooseAudioTrack(media.audio_tracks[1]);');
+ assert.match(h.node('notice').textContent,/Hindi/);
+ h.run('chooseSubtitleTrack(media.subtitle_tracks[0]);');
+ assert.equal(h.run('selectedAudioTrack().id'),'audio2');
+ assert.equal(h.run('selectedSubtitleTrack().id'),'s0');
+ assert.equal(h.run("localStorage.getItem('tw-audio-language')"),'hin');
+ assert.equal(h.run("localStorage.getItem('tw-subtitle')"),'eng');
+ assert.equal(h.node('audioTrackLabel').textContent,'Hindi');
+ assert.equal(h.node('subtitleTrackLabel').textContent,'English');
+ assert.match(h.node('notice').textContent,/Subtitles: English/);
+ h.run('chooseSubtitleTrack(null);');
+ assert.equal(h.run('selectedSubtitleTrack()'),null);
+ assert.equal(h.node('subtitleTrackLabel').textContent,'Off');
+ h.run('mode="audio";');
+ assert.equal(h.run("playbackPath()"),'/hls/movie/audio2.m3u8');
+});
+
+
+test('subtitle toggle restores the chosen language and hides in audio-only mode',()=>{
+ const h=browserHarness();
+ h.run('media={id:"movie",format:"hls",subtitle_tracks:[{id:"en",language:"eng"},{id:"hi",language:"hin"}]};mode="combined";chooseSubtitleTrack(media.subtitle_tracks[1]);');
+ assert.equal(h.node('subtitleToggle').textContent,'Hide subtitles');
+ h.node('subtitleToggle').onclick();
+ assert.equal(h.run('selectedSubtitleTrack()'),null);
+ assert.equal(h.node('subtitleToggle').textContent,'Show subtitles');
+ h.node('subtitleToggle').onclick();
+ assert.equal(h.run('selectedSubtitleTrack().id'),'hi');
+ h.run('mode="audio";updateTrackButtons();');
+ assert.equal(h.node('subtitleToggle').hidden,true);
+ h.run('mode="combined";media.subtitle_tracks=[];updateTrackButtons();');
+ assert.equal(h.node('subtitleToggle').hidden,true);
 });

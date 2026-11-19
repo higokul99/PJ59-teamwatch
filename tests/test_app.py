@@ -523,6 +523,57 @@ class RoomTests(unittest.TestCase):
                 expected = {'audio'} if track.startswith('audio') else {'video'} if track.startswith('video') else {'audio', 'video'}
                 self.assertEqual(types, expected)
 
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe unavailable')
+    def test_multiple_audio_languages_and_subtitles_are_prepared_and_served(self):
+        ident = 'multiaudio'
+        source = app.DATA / f'{ident}.upload'
+        english = app.DATA / 'multiaudio-eng.srt'
+        hindi = app.DATA / 'multiaudio-hin.srt'
+        english.write_text('1\n00:00:00,500 --> 00:00:02,500\nEnglish subtitle\n')
+        hindi.write_text('1\n00:00:00,500 --> 00:00:02,500\nयह हिंदी उपशीर्षक है\n')
+        subprocess.run(['ffmpeg', '-y', '-v', 'error',
+                        '-f', 'lavfi', '-i', 'testsrc=size=320x180:rate=24',
+                        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+                        '-f', 'lavfi', '-i', 'sine=frequency=880:sample_rate=48000',
+                        '-i', str(english), '-i', str(hindi),
+                        '-map', '0:v', '-map', '1:a', '-map', '2:a', '-map', '3:s', '-map', '4:s',
+                        '-t', '6', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-g', '24', '-c:a', 'aac',
+                        '-metadata:s:a:0', 'language=eng', '-metadata:s:a:0', 'title=English',
+                        '-metadata:s:a:1', 'language=hin', '-metadata:s:a:1', 'title=Hindi',
+                        '-metadata:s:s:0', 'language=eng', '-metadata:s:s:1', 'language=hin',
+                        '-f', 'matroska', str(source)], check=True)
+        asyncio.run(app.process(source, ident, 'Multilingual movie'))
+        self.assertEqual(app.processing['status'], 'ready', app.processing)
+        self.assertEqual([track['language'] for track in app.media['audio_tracks']], ['eng', 'hin'])
+        self.assertEqual([track['id'] for track in app.media['audio_tracks']], ['audio', 'audio2'])
+        self.assertEqual([track['language'] for track in app.media['subtitle_tracks']], ['eng', 'hin'])
+        folder = app.DATA / ident
+        master = (folder / 'master.m3u8').read_text()
+        self.assertIn('TYPE=AUDIO', master)
+        self.assertIn('NAME="English"', master)
+        self.assertIn('NAME="Hindi"', master)
+        self.assertIn('audio2/index.m3u8', master)
+        self.assertTrue((folder / 'audio2.m3u8').is_file())
+        self.assertTrue((folder / 'subtitles/s1.vtt').read_text().startswith('WEBVTT'))
+        self.assertIn('हिंदी', (folder / 'subtitles/s1.vtt').read_text())
+        self.assertEqual(self.client.get(f'/hls/{ident}/master.m3u8').status_code, 401)
+        self.join()
+        master_route = self.client.get(f'/hls/{ident}/master.m3u8')
+        self.assertEqual(master_route.status_code, 200)
+        self.assertIn('audio2/index.m3u8', master_route.text)
+        self.assertEqual(self.client.get(f'/hls/{ident}/audio2.m3u8').status_code, 200)
+        self.assertEqual(self.client.get(f'/hls/{ident}/audio2/index.m3u8').status_code, 200)
+        self.assertEqual(self.client.get(f'/hls/{ident}/audio2/segment_000000.m4s').status_code, 200)
+        details = self.client.get(f'/api/hls/{ident}/subtitles/s1.vtt')
+        self.assertEqual(details.status_code, 200)
+        self.assertEqual(details.json()['type'], 'text/vtt')
+        subtitle = self.client.get(f'/hls/{ident}/subtitles/s1.vtt')
+        self.assertEqual(subtitle.status_code, 200)
+        self.assertTrue(subtitle.headers['content-type'].startswith('text/vtt'))
+        self.assertIn('हिंदी', subtitle.text)
+        self.assertEqual(self.client.get(f'/hls/{ident}/subtitles/s0.txt').status_code, 404)
+        self.assertEqual(self.client.get(f'/hls/{ident}/subtitles/s0.vtt.tmp').status_code, 404)
+
 
 
 if __name__ == '__main__':

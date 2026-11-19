@@ -107,3 +107,10 @@ test('immutable HLS media segments use the cache while growing playlists do not'
  assert.throws(()=>h.run('mediaPath("/hls/0123456789abcdef01234567/audio/index.m3u8")'));
  assert.throws(()=>h.run('mediaPath("/hls/0123456789abcdef01234567/audio/segment_000000.m4s.tmp")'));
 });
+test('alternate audio languages are cacheable while subtitle sidecars stay on the network',async()=>{
+ const h=workerHarness(32,'/hls/0123456789abcdef01234567/audio2/segment_000000.m4s');
+ const response=await h.serve();
+ assert.deepEqual(new Uint8Array(await response.arrayBuffer()),h.bytes);
+ assert.throws(()=>h.run('mediaPath("/hls/0123456789abcdef01234567/subtitles/s0.vtt")'));
+ assert.throws(()=>h.run('mediaPath("/hls/0123456789abcdef01234567/audio2/index.m3u8")'));
+});

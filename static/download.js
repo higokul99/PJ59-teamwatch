@@ -34,13 +34,13 @@
   return readyPromise;
  }
  function stop(){generation++;}
- async function start(path,onProgress){
+ async function start(path,onProgress,options={}){
   const current=++generation;
   const emit=value=>{if(current===generation)onProgress(value);};
   if(!await ready()){emit({status:'fallback',message:'Download storage unavailable. Using streaming.'});return;}
   if(current!==generation)return;
   try{
-   if(path.startsWith('/hls/')){await hlsDownload(path,current,emit);return;}
+   if(path.startsWith('/hls/')){await hlsDownload(path,current,emit,options);return;}
    const response=await fetch('/api'+path,{cache:'no-store'});
    if(!response.ok)throw Error('Could not read media details');
    const metadata=await response.json();
@@ -59,34 +59,31 @@
    }
   }catch(error){emit({status:'error',message:`Download paused: ${error.message}. Playback can still stream. Retry download when connected.`});}
  }
- async function playlistTree(path,seen=new Set()){
+ async function playlistTree(path,options={},seen=new Set()){
   if(seen.has(path))return {groups:[],complete:true};
   seen.add(path);
   const response=await fetch(path,{cache:'no-store'});
   if(!response.ok)throw Error('Prepared segments could not be read');
-  const text=await response.text(),files=[],children=[];
+  const text=await response.text();
   function resolve(value){
    const url=new URL(value,new URL(path,location.origin));
    if(url.origin!==location.origin||!url.pathname.startsWith('/hls/'))throw Error('Invalid playlist resource');
    return url.pathname;
   }
-  for(const raw of text.split('\n')){
-   const line=raw.trim();if(!line)continue;
-   if(line.startsWith('#EXT-X-MAP:')){const match=/URI="([^"]+)"/.exec(line);if(match)files.push(resolve(match[1]));}
-   else if(line.startsWith('#EXT-X-MEDIA:')){const match=/URI="([^"]+)"/.exec(line);if(match)children.push(resolve(match[1]));}
-   else if(!line.startsWith('#')){const resource=resolve(line);resource.endsWith('.m3u8')?children.push(resource):files.push(resource);}
-  }
+  if(!root.TeamWatchPlaylist)throw Error('Playlist parser unavailable');
+  const parsed=root.TeamWatchPlaylist.entries(text,options);
+  const files=parsed.files.map(resolve),children=parsed.children.map(resolve);
   if(children.length){
-   const nested=await Promise.all(children.map(child=>playlistTree(child,seen)));
+   const nested=await Promise.all(children.map(child=>playlistTree(child,options,seen)));
    return {groups:nested.flatMap(item=>item.groups),complete:nested.every(item=>item.complete)};
   }
-  return {groups:[files],complete:text.includes('#EXT-X-ENDLIST')};
+  return {groups:[files],complete:parsed.complete};
  }
- async function hlsDownload(path,current,emit){
+ async function hlsDownload(path,current,emit,options={}){
   await request({type:'prune',id:path.split('/')[2]});
   const saved=new Set();let bytes=0;
   while(current===generation){
-   const tree=await playlistTree(path),ordered=[];
+   const tree=await playlistTree(path,options),ordered=[];
    const count=Math.max(0,...tree.groups.map(group=>group.length));
    // Interleave audio/video segments so both tracks download from the beginning.
    for(let index=0;index<count;index++)for(const group of tree.groups)if(group[index])ordered.push(group[index]);
