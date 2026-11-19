@@ -6,7 +6,6 @@ let enabled = false, clockOffset = 0, clockSamples = [], reconnect, pingTimer, l
 let startTimer, clockTimers = [], lastSeek = -Infinity, pendingForce = false, playPending = false;
 let downloadState={},stallSince=null,stallReported=-1,seekDragging=false,playbackSource='';
 let playbackEvents=[],playbackCounts={};
-let latestPreparation={};
 let subtitleKey='',openTrackMenuKind='';
 let languageNames=null;
 try{languageNames=new Intl.DisplayNames(['en'],{type:'language'});}catch{}
@@ -153,52 +152,6 @@ function renderDownload(){
  }
 }
 function seekLimit(){return media?Math.min(media.duration,media.available_duration??media.duration):0;}
-function renderPreparation(preparation){
- latestPreparation=preparation;
- renderHostPreparation();
- const visible=typeof preparation.percent==='number'||(media?.format==='hls')||['processing','uploading'].includes(preparation.status);
- $('preparePanel').hidden=!visible;
- if(!visible)return;
- const contextMedia=preparation.media_id&&preparation.media_id!==media?.id?null:media;
- const percent=Number.isFinite(preparation.percent)?preparation.percent:(preparation.status==='ready'&&contextMedia?.complete?100:null);
- if(percent===null){$('prepareProgress').removeAttribute('value');$('preparePercent').textContent='Working…';}
- else{$('prepareProgress').value=percent;$('preparePercent').textContent=`${percent.toFixed(1)}%`;}
- $('prepareHeading').textContent=preparation.status==='error'?'Preparation stopped':preparation.status==='uploading'?'Uploading movie':preparation.status==='ready'?'Movie ready':preparation.playable?'Ready to play · preparing the rest':'Preparing the first segments';
- const prepared=preparation.prepared_seconds??contextMedia?.available_duration??0;
- const total=preparation.total_seconds??contextMedia?.duration??0;
- const speed=preparation.speed?` · ${preparation.speed.toFixed(1)}× preparation speed`:'';
- $('prepareDetail').textContent=`${preparation.message}${total?` Prepared ${fmt(prepared)} of ${fmt(total)}.`:''}${speed}`;
- $('prepareHint').textContent=preparation.status==='error'?'Preparation stopped. Only the prepared portion is available; upload again to finish.':preparation.status==='ready'&&contextMedia?.complete?'The entire movie is ready. You can seek anywhere.':preparation.playable?`Play now${preparation.startup_seconds?` · first segments ready after ${preparation.startup_seconds.toFixed(1)} seconds`:''}. Available positions extend as background preparation continues.`:'Playback becomes available after the first few complete segments, without waiting for the whole movie.';
-}
-function preparationTime(seconds){
- const value=Math.max(0,Math.floor(Number(seconds)||0));
- return [Math.floor(value/3600),Math.floor(value/60)%60,value%60].map(n=>String(n).padStart(2,'0')).join(':');
-}
-function renderHostPreparation(){
- const preparation=latestPreparation;
- const current=preparation.media_id&&preparation.media_id!==media?.id?null:media;
- const total=Number(preparation.total_seconds??current?.duration??0);
- const complete=!!current?.complete;
- const prepared=Math.max(0,Math.min(total,complete?total:Number(preparation.prepared_seconds??current?.available_duration??0)));
- const activePosition=current&&roomState?TeamWatchSync.target(roomState,total,serverNow(),0):0;
- const ahead=Math.max(0,prepared-activePosition);
- $('hostPreparation').hidden=role!=='host'||!total;
- if(role!=='host'||!total)return;
- $('preparedThrough').textContent=preparationTime(prepared)+' / '+preparationTime(total);
- $('preparationRemaining').textContent=preparationTime(total-prepared);
- $('preparedAhead').textContent=current?preparationTime(ahead):'Next movie';
- const stopped=preparation.status==='error';
- const nearEdge=!complete&&!!current&&ahead<=30;
- $('hostPreparation').classList.toggle('prepared-complete',complete);
- $('hostPreparation').classList.toggle('preparation-warning',stopped||nearEdge);
- let advice;
- if(complete)advice='Fully prepared — the entire movie is ready. Tell participants they can connect, then check device readiness before starting.';
- else if(stopped)advice=`Preparation stopped at ${preparationTime(prepared)}. Upload again to prepare the rest of the movie.`;
- else if(!prepared)advice='No playable portion is prepared yet. Wait for the first segments, or wait for Fully prepared before starting the screening.';
- else advice=`Prepared from the start through ${preparationTime(prepared)}. Beyond this point, playback may pause until processing catches up.`;
- if(nearEdge&&!stopped&&prepared)advice+=' Playback is within 30 seconds of the prepared limit. Pause and wait, or wait for Fully prepared.';
- if($('preparationAdvice').textContent!==advice)$('preparationAdvice').textContent=advice;
-}
 $('retryDownload').onclick=downloadTrack;
 $('clearDownloads').onclick=async()=>{if(globalThis.TeamWatchDownload)await TeamWatchDownload.clear();downloadState={};$('downloadProgress').value=0;$('downloadStatus').textContent='Device downloads cleared. Playback can stream; tap Retry download to save again.';reportStatus();};
 
@@ -231,7 +184,7 @@ function receiveState(data){
  if(!globalThis.TeamWatchLibrary)$('upload').textContent=media?'Upload & replace':'Upload & prepare';
  $('play').disabled=$('pause').disabled=$('restart').disabled=$('seek').disabled=$('syncAll').disabled=$('back10').disabled=$('forward10').disabled=$('jumpTime').disabled=$('jumpButton').disabled=!media;
  if(media){$('seek').max=seekLimit();}
- renderPreparation(data.processing);renderDownload();
+ renderDownload();
  notice(data.processing.status==='error'||busy?data.processing.message:(data.timeline.reason||data.processing.message));
  configureMedia(); scheduleStart(); sync();
 }
@@ -271,7 +224,7 @@ function configureMedia(){
  mediaKey=key; enabled=false; stallSince=null;downloadState={};reportStatus(); playPending=false; pendingForce=true; lastSeek=-Infinity; clearTimeout(startTimer);
  for(const el of [$('video'),$('audio')]){el.pause();el.removeAttribute('src');el.load();}
  $('resync').disabled=!media; $('retryDownload').disabled=!media;
- $('connect').disabled=!media; $('connect').textContent='Connect playback';
+ $('connect').dataset.disabledReason='Select an episode with playable media first.'; $('connect').disabled=!media; $('connect').textContent='Connect playback';
  $('connectHint').textContent='Tap to enable playback on this device.';
  $('volume').disabled=mode==='video';
  $('placeholder').hidden=!!media&&mode!=='audio';
@@ -289,7 +242,7 @@ function configureMedia(){
   playbackSource=playbackPath();
   if(globalThis.TeamWatchPlayer){
    const supported=TeamWatchPlayer.attach(p,playbackSource,playerError,{onReady:applyAudioSelection});
-   if(!supported){$('connect').disabled=true;configureSubtitles();updateTrackButtons();return;}
+   if(!supported){$('connect').dataset.disabledReason='This browser cannot play this media format. Try a browser with HLS support.';$('connect').disabled=true;configureSubtitles();updateTrackButtons();return;}
   }else{p.src=playbackSource;p.load();}
   downloadTrack(); $('screenTitle').textContent='Just you and the sound.';
   $('screenText').textContent='Put on your headphones. Playback follows the host.';
@@ -309,7 +262,7 @@ function attachAudioOnly(){
  rateController.reset();stallSince=null;downloadState={};playPending=false;pendingForce=true;lastSeek=-Infinity;
  if(globalThis.TeamWatchPlayer){
   const supported=TeamWatchPlayer.attach(p,playbackSource,playerError,{onReady:applyAudioSelection});
-  if(!supported){$('connect').disabled=true;return;}
+  if(!supported){$('connect').dataset.disabledReason='This browser cannot play this media format. Try a browser with HLS support.';$('connect').disabled=true;return;}
  }else{p.src=playbackSource;p.load();}
  downloadTrack();reportStatus();
  if(enabled){
@@ -479,7 +432,6 @@ function targetPosition(){
  return TeamWatchSync.target(roomState,media.duration,serverNow(),adjustment);
 }
 function sync(force=false){
- renderHostPreparation();
  if(force)pendingForce=true;
  if(!media||!roomState)return;
  const p=player(), target=targetPosition();
