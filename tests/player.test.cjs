@@ -57,3 +57,21 @@ test('native HLS enables the chosen alternate audio track',()=>{
  assert.equal(h.element.audioTracks[1].enabled,true);
  assert.equal(h.api.selectAudio(3,{label:'Missing'}),false);
 });
+
+test('audio requested before manifest readiness is applied when tracks arrive',()=>{
+ const h=playerHarness();h.api.attach(h.element,'/hls/movie/master.m3u8',()=>{});
+ assert.equal(h.api.selectAudio(1,{id:'audio2',label:'English'}),true);
+ const engine=h.engines[0];engine.audioTracks=[{name:'Hindi'},{name:'English'}];engine.fire('manifestparsed');
+ assert.equal(engine.audioTrack,1);
+});
+test('rendition URI takes precedence over duplicate names and reordered indexes',()=>{
+ const h=playerHarness();h.api.attach(h.element,'/hls/movie/master.m3u8',()=>{});
+ const engine=h.engines[0];engine.audioTracks=[{name:'Audio',url:'https://example.test/hls/movie/audio2/index.m3u8'},{name:'Audio',url:'https://example.test/hls/movie/audio/index.m3u8'}];
+ assert.equal(h.api.selectAudio(1,{id:'audio2',label:'Audio'}),true);assert.equal(engine.audioTrack,0);
+});
+test('native audio selection follows language labels when browser order differs',()=>{
+ const h=playerHarness(true,false);h.element.audioTracks=[{label:'English',enabled:false},{label:'Hindi',enabled:true}];
+ h.api.attach(h.element,'/hls/movie/master.m3u8',()=>{});
+ assert.equal(h.api.selectAudio(1,{label:'English'}),true);
+ assert.equal(h.element.audioTracks[0].enabled,true);assert.equal(h.element.audioTracks[1].enabled,false);
+});

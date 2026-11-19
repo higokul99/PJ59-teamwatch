@@ -267,3 +267,17 @@ test('subtitle toggle restores the chosen language and hides in audio-only mode'
  h.run('mode="combined";media.subtitle_tracks=[];updateTrackButtons();');
  assert.equal(h.node('subtitleToggle').hidden,true);
 });
+
+test('exact audio track selection survives duplicate language metadata',()=>{
+ const h=browserHarness();
+ h.run('media={id:"movie",format:"hls",audio_tracks:[{id:"audio",label:"Hindi",language:"und"},{id:"audio2",label:"English",language:"und"}]};mode="combined";');
+ h.run('globalThis.TeamWatchPlayer={selectAudio(index,track){globalThis.appliedAudio=track.id;return true;}};chooseAudioTrack(media.audio_tracks[1]);');
+ assert.equal(h.run('selectedAudioTrack().id'),'audio2');assert.equal(h.run('appliedAudio'),'audio2');
+ h.run('chooseAudioTrack(media.audio_tracks[0]);');assert.equal(h.run('appliedAudio'),'audio');
+});
+test('rejected audio switch restores the previous choice and reports failure',()=>{
+ const h=browserHarness();
+ h.run('media={id:"movie",format:"hls",audio_tracks:[{id:"audio",label:"Hindi",language:"hin"},{id:"audio2",label:"English",language:"eng"}]};mode="combined";globalThis.TeamWatchPlayer={selectAudio(){return false;}};chooseAudioTrack(media.audio_tracks[1]);');
+ assert.equal(h.run('selectedAudioTrack().id'),'audio');
+ assert.match(h.node('notice').textContent,/Could not switch/);
+});

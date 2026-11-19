@@ -38,6 +38,9 @@ function audioTracks(){
 function subtitleTracks(){return Array.isArray(media?.subtitle_tracks)?media.subtitle_tracks:[];}
 function selectedAudioTrack(){
  const tracks=audioTracks();if(!tracks.length)return null;
+ const exact=localStorage.getItem('tw-audio-track');
+ const match=tracks.find(track=>exact===`${media?.id}:${track.id}`);
+ if(match)return match;
  const saved=localStorage.getItem('tw-audio-language')||'';
  return tracks.find(track=>saved&&trackKey(track)===saved)||tracks[0];
 }
@@ -272,11 +275,11 @@ function attachAudioOnly(){
  }
 }
 function applyAudioSelection(){
- if(mode==='audio')return;
+ if(mode==='audio')return true;
  const track=selectedAudioTrack();
  if(!track||!globalThis.TeamWatchPlayer)return;
  const index=audioTracks().findIndex(item=>item.id===track.id);
- TeamWatchPlayer.selectAudio(index,track);
+ return TeamWatchPlayer.selectAudio(index,track);
 }
 function applySubtitleSelection(){
  const chosen=selectedSubtitleTrack();
@@ -374,11 +377,23 @@ function chooseAudioTrack(track){
  if(!track)return;
  const current=selectedAudioTrack();
  if(current&&current.id===track.id){updateTrackButtons();return;}
+ const previousLanguage=localStorage.getItem('tw-audio-language')||'';
+ const previousTrack=localStorage.getItem('tw-audio-track')||'';
  localStorage.setItem('tw-audio-language',trackKey(track));
+ localStorage.setItem('tw-audio-track',`${media.id}:${track.id}`);
  if(mode==='audio'&&media?.format==='hls')attachAudioOnly();
- else{applyAudioSelection();downloadTrack();}
+ else{
+  if(applyAudioSelection()===false){
+   localStorage.setItem('tw-audio-language',previousLanguage);
+   localStorage.setItem('tw-audio-track',previousTrack);
+   updateTrackButtons();
+   notice('Could not switch audio on this device. Reconnect playback and try again.');
+   return;
+  }
+  downloadTrack();
+ }
  updateTrackButtons();
- notice(`Audio language: ${trackName(track)} on this device.`);
+ notice(`Audio requested: ${trackName(track)} on this device.`);
 }
 function chooseSubtitleTrack(track){
  if(track)localStorage.setItem('tw-subtitle-last',trackKey(track));
